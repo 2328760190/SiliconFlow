@@ -79,7 +79,7 @@ MIT License
 
 ## 📞 联系方式
 
-如有问题，请联系: #linux.do@xingkongxiangban
+如有问题，请联系: #hello@464888.xyz
 
 # 详细中文文档
 
@@ -559,7 +559,7 @@ A: 由于兼容OpenAI API标准，任何支持OpenAI API的客户端库都可以
 
 ## 更新日志
 
-### v1.0.0 (2023-12-31)
+### v1.0.0 (2025-3-23)
 
 - 初始版本发布
 - 支持OpenAI API兼容接口
