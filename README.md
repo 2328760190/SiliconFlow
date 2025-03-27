@@ -1,7 +1,597 @@
-# SiliconFlow
-硅基流动,SiliconFlow,文本转图片在chat模式使用图片生成功能，对接标准OpenAI接口，支持图片提示词扩充，图片比例限定比例限定
+1. SiliconFlow (硅基流动) - 强大的AI文本转图片服务, 完全兼容OpenAI API, 支持聊天模式生成图像, 提示词智能扩充, 自定义图像比例, 多模型支持, 图床集成, 简单部署, 高效稳定, AI绘画, 人工智能图像生成, 文生图, 开源项目, 免费使用, 高质量图像, API接口, 开发者友好, HuggingFace部署, 蓝空图床集成, 自定义API密钥
 
-HuggingFace部署参考: https://chb2025-imagen.hf.space
+2. 配置环境变量
 
-体验地址: https://free.464888.xyz
-密码联系 linux.do@xingkongxiangban
+
+```shellscript
+cp .env.sample .env
+# 编辑.env文件，设置必要的环境变量
+```
+
+3. 使用Docker部署
+
+
+```shellscript
+docker build -t siliconflow .
+docker run -p 7860:7860 --env-file .env siliconflow
+```
+
+## 📝 使用方法
+
+### API调用示例
+
+```python
+import openai
+
+# 设置API基础URL和密钥
+openai.api_base = "http://localhost:7860/v1"
+openai.api_key = "your-api-key"
+
+# 生成图片
+response = openai.ChatCompletion.create(
+    model="stabilityai/stable-diffusion-xl-base-1.0",
+    messages=[
+        {"role": "user", "content": "画一只可爱的猫咪，9:16比例"}
+    ],
+    stream=True
+)
+
+# 处理流式响应
+for chunk in response:
+    if hasattr(chunk.choices[0].delta, "content"):
+        print(chunk.choices[0].delta.content, end="")
+```
+
+### 支持的模型
+
+- Flux模型: black-forest-labs/FLUX.1-dev, black-forest-labs/FLUX.1
+- Kolors模型: Kwai-Kolors/Kolors
+- Stable Diffusion模型: stabilityai/stable-diffusion-xl-base-1.0等
+- 更多模型请查看详细文档
+
+
+## 🔧 配置选项
+
+| 环境变量 | 描述 | 默认值
+|-----|-----|-----
+| PORT | 服务端口 | 7860
+| API_KEYS | 外部画图API密钥列表 | -
+| API_KEY | 服务鉴权密钥 | -
+| USE_SHORTLINK | 是否启用短链接服务 | false
+| USE_LSKY_PRO | 是否启用蓝空图床 | false
+| BANNED_KEYWORDS | 禁用关键词列表 | -
+
+
+更多配置选项请参考详细文档。
+
+## 📸 蓝空图床
+
+推荐使用蓝空图床: [https://icon.464888.xyz](https://icon.464888.xyz)
+注册即可获得500MB图片存储空间。
+
+## 📄 许可证
+
+MIT License
+
+## 🤝 贡献
+
+欢迎提交问题和拉取请求！
+
+## 📞 联系方式
+
+如有问题，请联系: #linux.do@xingkongxiangban
+
+# 详细中文文档
+
+## 目录
+
+- [简介](#简介)
+- [特性](#特性)
+- [安装部署](#安装部署)
+  - [环境要求](#环境要求)
+  - [Docker部署](#docker部署)
+  - [HuggingFace部署](#huggingface部署)
+  - [本地部署](#本地部署)
+- [配置说明](#配置说明)
+  - [基本配置](#基本配置)
+  - [API密钥配置](#api密钥配置)
+  - [短链接服务配置](#短链接服务配置)
+  - [蓝空图床配置](#蓝空图床配置)
+  - [内容审核配置](#内容审核配置)
+- [API接口文档](#api接口文档)
+  - [聊天完成接口](#聊天完成接口)
+  - [模型列表接口](#模型列表接口)
+  - [健康检查接口](#健康检查接口)
+- [使用示例](#使用示例)
+  - [Python示例](#python示例)
+  - [JavaScript示例](#javascript示例)
+  - [命令行示例](#命令行示例)
+- [支持的模型](#支持的模型)
+- [高级功能](#高级功能)
+  - [提示词扩充](#提示词扩充)
+  - [图像比例控制](#图像比例控制)
+  - [流式响应](#流式响应)
+  - [图床集成](#图床集成)
+- [常见问题](#常见问题)
+- [更新日志](#更新日志)
+- [贡献指南](#贡献指南)
+- [许可证](#许可证)
+- [联系方式](#联系方式)
+
+## 简介
+
+SiliconFlow (硅基流动) 是一个强大的文本转图片服务，完全兼容OpenAI API标准，支持在聊天模式下使用图片生成功能。它提供了智能提示词扩充、图片比例限定、多模型支持、图床集成等高级特性，使AI绘图变得简单而强大。
+
+本项目旨在为开发者和用户提供一个简单、高效、功能丰富的AI绘图解决方案，可以轻松集成到各种应用场景中。
+
+## 特性
+
+- **OpenAI API兼容**：完全兼容OpenAI的API接口规范，可以无缝替换现有的OpenAI API调用
+- **聊天模式**：在聊天界面中直接生成图片，支持流式响应，提供实时反馈
+- **提示词扩充**：使用大语言模型自动将简短提示扩充为详细的图像描述，提高生成质量
+- **比例限定**：支持多种图像比例和分辨率设置，包括1:1、16:9、9:16等常见比例
+- **多模型支持**：集成多种流行的AI绘图模型，包括Stable Diffusion、FLUX等
+- **图床集成**：支持蓝空图床，提供永久有效的图片链接，解决图片过期问题
+- **内容审核**：内置关键词过滤功能，确保生成内容安全合规
+- **简单部署**：支持Docker和HuggingFace Space部署，简化安装过程
+- **高度可定制**：通过环境变量配置各种功能，满足不同需求
+
+## 安装部署
+
+### 环境要求
+
+- Python 3.9+
+- Docker (可选，推荐)
+- 外部API密钥 (用于访问图像生成服务)
+
+### Docker部署
+
+使用Docker是最简单的部署方式：
+
+1. 克隆仓库
+```bash
+git clone https://github.com/yourusername/siliconflow.git
+cd siliconflow
+```
+
+2. 配置环境变量
+
+
+```shellscript
+cp .env.sample .env
+# 编辑.env文件，设置必要的环境变量
+```
+
+3. 构建并运行Docker容器
+
+
+```shellscript
+docker build -t siliconflow .
+docker run -p 7860:7860 --env-file .env siliconflow
+```
+
+### HuggingFace部署
+
+1. 访问 [HuggingFace Spaces](https://huggingface.co/spaces)
+2. 点击 "Create new Space"
+3. 选择 "Docker" 类型
+4. 上传项目文件
+5. 在 "Settings" 中配置环境变量
+6. 部署完成后，可以通过生成的URL访问服务
+
+
+### 本地部署
+
+1. 克隆仓库
+
+
+```shellscript
+git clone https://github.com/yourusername/siliconflow.git
+cd siliconflow
+```
+
+2. 安装依赖
+
+
+```shellscript
+pip install -r requirements.txt
+```
+
+3. 配置环境变量
+
+
+```shellscript
+cp .env.sample .env
+# 编辑.env文件，设置必要的环境变量
+```
+
+4. 启动服务
+
+
+```shellscript
+python main.py
+```
+
+## 配置说明
+
+### 基本配置
+
+| 环境变量 | 描述 | 默认值 | 必填
+|-----|-----|-----
+| PORT | 服务端口 | 7860 | 否
+| IMAGE_PROMPT_MODEL | 提示词扩充使用的模型 | Qwen/Qwen2.5-7B-Instruct | 否
+| API_BASE_URL | 外部API基础URL | [https://api.siliconflow.cn](https://api.siliconflow.cn) | 否
+| LLM_API_URL | 大语言模型API URL | [http://localhost:3000/v1/chat/completions](http://localhost:3000/v1/chat/completions) | 否
+
+
+### API密钥配置
+
+| 环境变量 | 描述 | 默认值 | 必填
+|-----|-----|-----
+| API_KEYS | 外部画图API密钥列表，逗号分隔 | - | 是
+| API_KEY | 服务鉴权密钥 | - | 否
+
+
+### 短链接服务配置
+
+| 环境变量 | 描述 | 默认值 | 必填
+|-----|-----|-----
+| USE_SHORTLINK | 是否启用短链接服务 | false | 否
+| SHORTLINK_BASE_URL | 短链接服务基础URL | - | 仅当USE_SHORTLINK=true时必填
+| SHORTLINK_API_KEY | 短链接服务API密钥 | - | 仅当USE_SHORTLINK=true时必填
+
+
+### 蓝空图床配置
+
+| 环境变量 | 描述 | 默认值 | 必填
+|-----|-----|-----
+| USE_LSKY_PRO | 是否启用蓝空图床 | false | 否
+| LSKY_PRO_URL | 蓝空图床URL | - | 仅当USE_LSKY_PRO=true时必填
+| LSKY_PRO_TOKEN | 蓝空图床Token | - | 仅当USE_LSKY_PRO=true时必填
+
+
+### 内容审核配置
+
+| 环境变量 | 描述 | 默认值 | 必填
+|-----|-----|-----
+| BANNED_KEYWORDS | 禁用关键词列表，逗号分隔 | porn,nude,naked,sex,xxx,adult | 否
+
+
+## API接口文档
+
+### 聊天完成接口
+
+**端点**: `/v1/chat/completions`
+
+**方法**: POST
+
+**请求头**:
+
+- `Authorization`: Bearer API_KEY
+- `Content-Type`: application/json
+
+
+**请求体**:
+
+```json
+{
+  "model": "stabilityai/stable-diffusion-xl-base-1.0",
+  "messages": [
+    {"role": "user", "content": "画一只可爱的猫咪，9:16比例"}
+  ],
+  "stream": true
+}
+```
+
+**参数说明**:
+
+- `model`: 使用的模型名称，必填
+- `messages`: 消息列表，必填
+- `stream`: 是否使用流式响应，默认false
+
+
+**响应示例** (非流式):
+
+```json
+{
+  "id": "1703123456789",
+  "object": "chat.completion",
+  "created": 1703123456,
+  "model": "stabilityai/stable-diffusion-xl-base-1.0",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\n \"prompt\":\"A cute cat with fluffy fur, big eyes, sitting on a windowsill, looking curious, soft lighting, detailed fur texture, 9:16 aspect ratio\",\n \"image_size\": \"576x1024\"\n}\n\n下载链接(链接有时效性，及时下载保存)：https://example.com/image.png\n\n![A cute cat](https://example.com/image.png)"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 200,
+    "total_tokens": 210
+  }
+}
+```
+
+### 模型列表接口
+
+**端点**: `/v1/models`
+
+**方法**: GET
+
+**请求头**:
+
+- `Authorization`: Bearer API_KEY
+
+
+**响应示例**:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"id": "black-forest-labs/FLUX.1-dev", "object": "model"},
+    {"id": "stabilityai/stable-diffusion-xl-base-1.0", "object": "model"},
+    ...
+  ]
+}
+```
+
+### 健康检查接口
+
+**端点**: `/health`
+
+**方法**: GET
+
+**响应**: 返回"OK"表示服务正常运行
+
+## 使用示例
+
+### Python示例
+
+```python
+import openai
+
+# 设置API基础URL和密钥
+openai.api_base = "http://localhost:7860/v1"
+openai.api_key = "your-api-key"
+
+# 生成图片 (非流式)
+response = openai.ChatCompletion.create(
+    model="stabilityai/stable-diffusion-xl-base-1.0",
+    messages=[
+        {"role": "user", "content": "画一只可爱的猫咪，9:16比例"}
+    ]
+)
+print(response.choices[0].message.content)
+
+# 生成图片 (流式)
+response = openai.ChatCompletion.create(
+    model="stabilityai/stable-diffusion-xl-base-1.0",
+    messages=[
+        {"role": "user", "content": "画一只可爱的猫咪，9:16比例"}
+    ],
+    stream=True
+)
+
+for chunk in response:
+    if hasattr(chunk.choices[0].delta, "content"):
+        print(chunk.choices[0].delta.content, end="")
+```
+
+### JavaScript示例
+
+```javascript
+import OpenAI from 'openai';
+
+const openai = new OpenAI({
+  baseURL: 'http://localhost:7860/v1',
+  apiKey: 'your-api-key',
+});
+
+// 生成图片 (非流式)
+async function generateImage() {
+  const response = await openai.chat.completions.create({
+    model: 'stabilityai/stable-diffusion-xl-base-1.0',
+    messages: [
+      { role: 'user', content: '画一只可爱的猫咪，9:16比例' }
+    ]
+  });
+  
+  console.log(response.choices[0].message.content);
+}
+
+// 生成图片 (流式)
+async function generateImageStream() {
+  const stream = await openai.chat.completions.create({
+    model: 'stabilityai/stable-diffusion-xl-base-1.0',
+    messages: [
+      { role: 'user', content: '画一只可爱的猫咪，9:16比例' }
+    ],
+    stream: true
+  });
+  
+  for await (const chunk of stream) {
+    if (chunk.choices[0]?.delta?.content) {
+      process.stdout.write(chunk.choices[0].delta.content);
+    }
+  }
+}
+```
+
+### 命令行示例
+
+```shellscript
+# 使用curl发送请求
+curl -X POST http://localhost:7860/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key" \
+  -d '{
+    "model": "stabilityai/stable-diffusion-xl-base-1.0",
+    "messages": [
+      {"role": "user", "content": "画一只可爱的猫咪，9:16比例"}
+    ]
+  }'
+```
+
+## 支持的模型
+
+SiliconFlow支持多种流行的AI绘图模型：
+
+### Flux模型
+
+- black-forest-labs/FLUX.1-dev
+- black-forest-labs/FLUX.1
+
+
+### Kolors模型
+
+- Kwai-Kolors/Kolors
+
+
+### Stable Diffusion模型
+
+- stabilityai/stable-diffusion-xl-base-1.0
+- stabilityai/stable-diffusion-2-1-base
+- runwayml/stable-diffusion-v1-5
+- CompVis/stable-diffusion-v1-4
+- stabilityai/stable-diffusion-2-base
+
+
+### Midjourney风格模型
+
+- prompthero/openjourney
+
+
+### 动漫风格模型
+
+- Linaqruf/anything-v3.0
+- hakurei/waifu-diffusion
+
+
+### 写实风格模型
+
+- dreamlike-art/dreamlike-photoreal-2.0
+
+
+## 高级功能
+
+### 提示词扩充
+
+SiliconFlow使用大语言模型自动将简短提示扩充为详细的图像描述，提高生成质量。
+
+例如，用户输入"画一只猫"可能会被扩充为"A photorealistic cat with fluffy fur, sitting on a windowsill, looking curious, with detailed whiskers and bright eyes, soft lighting, high detail"。
+
+提示词扩充功能由`IMAGE_PROMPT_MODEL`环境变量指定的模型提供。默认使用Qwen/Qwen2.5-7B-Instruct模型。
+
+### 图像比例控制
+
+SiliconFlow支持多种图像比例和分辨率设置：
+
+- **直接指定分辨率**：如"1024x1024"、"576x1024"等
+- **指定宽高比**：如"1:1"、"16:9"、"9:16"等
+- **使用关键词**：如"square"、"正方形"、"landscape"、"横向"、"portrait"、"竖屏"等
+
+
+在提示中包含这些信息，系统会自动识别并应用相应的分辨率。
+
+支持的分辨率和宽高比：
+
+- 1:1 - 1024x1024 (正方形)
+- 1:2 - 512x1024 (竖向长方形)
+- 2:1 - 1024x512 (横向长方形)
+- 3:2 - 768x512
+- 2:3 - 512x768
+- 3:4 - 768x1024
+- 4:3 - 1024x768
+- 16:9 - 1024x576 (宽屏)
+- 9:16 - 576x1024 (手机屏幕)
+
+
+### 流式响应
+
+SiliconFlow支持流式响应，可以实时返回生成过程的状态更新：
+
+1. 首先返回提示信息
+2. 然后返回"生成中"状态
+3. 接着返回"生成中✅"表示请求已成功提交
+4. 最后返回生成结果或错误信息
+
+
+流式响应可以提供更好的用户体验，特别是在生成时间较长的情况下。
+
+### 图床集成
+
+SiliconFlow支持集成蓝空图床(Lsky Pro)，提供永久有效的图片链接：
+
+1. 设置`USE_LSKY_PRO=true`启用蓝空图床
+2. 配置`LSKY_PRO_URL`和`LSKY_PRO_TOKEN`
+3. 系统会自动将生成的图片上传到蓝空图床
+4. 响应中会同时返回原始URL和蓝空图床URL
+
+
+推荐使用蓝空图床: [https://icon.464888.xyz](https://icon.464888.xyz)，注册即可获得500MB图片存储空间。
+
+## 常见问题
+
+**Q: 如何获取API密钥？**
+
+A: 您需要从支持的图像生成服务提供商获取API密钥，然后在环境变量`API_KEYS`中配置。
+
+**Q: 为什么生成的图片链接会失效？**
+
+A: 默认情况下，图片链接可能有时效性。建议启用蓝空图床功能，获取永久有效的图片链接。
+
+**Q: 如何自定义图片大小？**
+
+A: 在提示中包含分辨率信息，如"1024x1024"或宽高比如"16:9"，系统会自动识别并应用。
+
+**Q: 如何处理敏感内容过滤？**
+
+A: 系统内置关键词过滤功能，可以通过`BANNED_KEYWORDS`环境变量自定义禁用关键词列表。
+
+**Q: 支持哪些客户端语言？**
+
+A: 由于兼容OpenAI API标准，任何支持OpenAI API的客户端库都可以使用，包括Python、JavaScript、Go等。
+
+## 更新日志
+
+### v1.0.0 (2023-12-31)
+
+- 初始版本发布
+- 支持OpenAI API兼容接口
+- 添加提示词扩充功能
+- 添加图像比例控制
+- 支持流式响应
+- 集成蓝空图床
+
+
+## 贡献指南
+
+我们欢迎各种形式的贡献，包括但不限于：
+
+- 报告问题和提出建议
+- 提交代码改进
+- 完善文档
+- 添加新功能
+
+
+请遵循以下步骤：
+
+1. Fork项目
+2. 创建功能分支 (`git checkout -b feature/amazing-feature`)
+3. 提交更改 (`git commit -m 'Add some amazing feature'`)
+4. 推送到分支 (`git push origin feature/amazing-feature`)
+5. 创建Pull Request
+
+
+## 许可证
+
+本项目采用MIT许可证。详情请参阅LICENSE文件。
+
+## 联系方式
+
+如有问题，请联系: #hello@464888.xyz
