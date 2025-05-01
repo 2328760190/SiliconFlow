@@ -120,6 +120,13 @@ def get_env_bool(key: str, default: bool = False) -> bool:
     value = os.environ.get(key, str(default)).lower()
     return value in ("true", "1", "yes", "y", "t")
 
+def get_env_int(key: str, default: int) -> int:
+    """获取整数类型环境变量，如果不存在则返回默认值"""
+    try:
+        return int(os.environ.get(key, str(default)))
+    except ValueError:
+        return default
+
 def get_random_api_key() -> str:
     """从API_KEYS环境变量中随机选择一个API密钥"""
     keys = get_env("API_KEYS", "").split(",")
@@ -353,7 +360,7 @@ def generate_image_stream(unique_id: int, current_timestamp: int, model: str, pr
             {
                 "index": 0,
                 "delta": {
-                    "content": f"```\n{{\n  \"prompt\":\"{prompt}\"\n}}\n```\n"
+                    "content": f"\`\`\`\n{{\n  \"prompt\":\"{prompt}\"\n}}\n\`\`\`\n"
                 }
             }
         ],
@@ -444,10 +451,13 @@ def generate_image_stream(unique_id: int, current_timestamp: int, model: str, pr
                     lsky_url = upload_to_lsky_pro(image_url)
                     
                     # 构建响应文本
+                    # 确保prompt不包含换行符
+                    safe_prompt = prompt.replace("\n", " ")
+                    
                     if lsky_url:
-                        task_text = f"✅\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n蓝空图床链接(永久有效)：{lsky_url}\n\n![{prompt}]({lsky_url})"
+                        task_text = f"✅\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n蓝空图床链接(永久有效)：{lsky_url}\n\n![image1|{safe_prompt}]({lsky_url})"
                     else:
-                        task_text = f"✅\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n![{prompt}]({short_url})"
+                        task_text = f"✅\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n![image1|{safe_prompt}]({short_url})"
                 else:
                     logger.error(f"图像项格式错误: {image_item}")
                     task_text = f"❌\n\n\`\`\`\n{{\n  \"message\":\"图像格式错误\"\n}}\n\`\`\`"
@@ -519,6 +529,29 @@ def verify_api_key(request_auth: str) -> bool:
     # 验证token
     return parts[1] == service_api_key
 
+def extract_image_count(text: str) -> tuple[str, int]:
+    """从文本中提取图片数量，并返回处理后的文本和图片数量"""
+    # 默认图片数量
+    default_count = get_env_int("MAX_IMAGES_PER_REQUEST", 4)
+    
+    # 查找 pic:number 模式
+    pattern = re.compile(r'\bpic:(\d+)\b')
+    match = pattern.search(text)
+    
+    if not match:
+        return text, 1  # 默认生成1张图片
+    
+    # 提取数量
+    count = int(match.group(1))
+    # 限制最大数量
+    count = min(count, default_count)
+    
+    # 从文本中移除 pic:number
+    cleaned_text = pattern.sub('', text).strip()
+    
+    logger.info(f"检测到图片数量设置: {count}张")
+    return cleaned_text, count
+
 # API路由
 @app.route("/v1/models", methods=["GET"])
 def list_models():
@@ -557,6 +590,9 @@ def handle_request():
             if message["role"] != "assistant":
                 full_context += message["content"] + "\n\n"
         context = full_context.strip()
+        
+        # 提取图片数量
+        context, image_count = extract_image_count(context)
         
         # 内容审核
         if moderate_check(context):
@@ -652,60 +688,93 @@ def handle_request():
                 }
                 return jsonify(response_payload)
         
-        # 获取外部API密钥
+        # 获取外部API密钥列表
         try:
-            external_api_key = get_random_api_key()
-            logger.info(f"使用外部API密钥: {external_api_key[:5]}...")
+            api_keys = get_env("API_KEYS", "").split(",")
+            if not api_keys or api_keys[0] == "":
+                raise ValueError("API_KEYS environment variable not set")
+            
+            # 确保有可用的API密钥
+            available_keys = len(api_keys)
+            max_images = get_env_int("MAX_IMAGES_PER_REQUEST", 4)
+            
+            # 用户请求的图片数量不能超过环境变量限制
+            requested_count = min(image_count, max_images)
+            
+            # 最终生成的图片数量为用户请求的数量（受环境变量限制）
+            final_count = requested_count
+            
+            logger.info(f"环境变量限制: {max_images}张, 用户请求: {image_count}张, 可用API密钥: {available_keys}个, 最终生成: {final_count}张")
+            
+            # 选择API密钥，允许重复使用以实现负载均衡
+            selected_keys = []
+            for i in range(final_count):
+                # 循环使用可用的API密钥
+                key_index = i % available_keys
+                selected_keys.append(api_keys[key_index])
+            
+            logger.info(f"已选择 {len(selected_keys)} 个API密钥用于图像生成（可能包含重复使用的密钥）")
         except ValueError as e:
             logger.error(f"获取外部API密钥失败: {e}")
             return jsonify({"error": "未配置外部API密钥，请设置API_KEYS环境变量"}), 500
         
         # 生成图像提示
-        prompt = generate_image_prompt(external_api_key, context)
+        prompt = generate_image_prompt(selected_keys[0], context)
+        # 确保prompt不包含换行符，避免Markdown格式问题
+        safe_prompt = prompt.replace("\n", " ")
+        
         image_size = match_resolution(context)  # 从原始上下文中匹配分辨率，而不是从生成的提示中
         logger.info(f"用户请求的图像尺寸: {image_size}")
         
         # 配置API URL
         api_base_url = get_env("API_BASE_URL", "https://api.siliconflow.cn")
         
-        # 根据模型选择合适的API端点
-        if body["model"] == "Kwai-Kolors/Kolors":
-            new_url = f"{api_base_url}/v1/images/generations"
-            new_request_body = {
-                "model": body["model"],
-                "prompt": prompt,
-                "image_size": image_size,
-                "batch_size": 1,
-                "num_inference_steps": 20,
-                "guidance_scale": 7.5
+        # 准备多个请求配置
+        request_configs = []
+        for i in range(final_count):
+            # 根据模型选择合适的API端点
+            if body["model"] == "Kwai-Kolors/Kolors":
+                new_url = f"{api_base_url}/v1/images/generations"
+                new_request_body = {
+                    "model": body["model"],
+                    "prompt": prompt,
+                    "image_size": image_size,
+                    "batch_size": 1,
+                    "num_inference_steps": 20,
+                    "guidance_scale": 7.5
+                }
+            elif "flux" in body["model"].lower():
+                new_url = f"{api_base_url}/v1/image/generations"
+                new_request_body = {
+                    "model": body["model"],
+                    "prompt": prompt,
+                    "image_size": image_size,
+                    "num_inference_steps": 20,
+                    "prompt_enhancement": True
+                }
+            else:
+                new_url = f"{api_base_url}/v1/{body['model']}/text-to-image"
+                new_request_body = {
+                    "prompt": prompt,
+                    "image_size": image_size,
+                    "num_inference_steps": 20
+                }
+            
+            # 设置外部API请求头 - 使用API_KEYS中的密钥，而不是服务的API_KEY
+            headers = {
+                "accept": "application/json",
+                "content-type": "application/json",
+                "Authorization": f"Bearer {selected_keys[i]}"
             }
-        elif "flux" in body["model"].lower():
-            new_url = f"{api_base_url}/v1/image/generations"
-            new_request_body = {
-                "model": body["model"],
-                "prompt": prompt,
-                "image_size": image_size,
-                "num_inference_steps": 20,
-                "prompt_enhancement": True
-            }
-        else:
-            new_url = f"{api_base_url}/v1/{body['model']}/text-to-image"
-            new_request_body = {
-                "prompt": prompt,
-                "image_size": image_size,
-                "num_inference_steps": 20
-            }
+            
+            request_configs.append({
+                "url": new_url,
+                "body": new_request_body,
+                "headers": headers,
+                "index": i
+            })
         
-        # 设置外部API请求头
-        headers = {
-            "accept": "application/json",
-            "content-type": "application/json",
-            "Authorization": f"Bearer {external_api_key}"
-        }
-        
-        logger.info(f"调用外部API: {new_url}")
-        logger.info(f"使用模型: {body['model']}")
-        logger.info(f"图像尺寸: {image_size}")
+        logger.info(f"准备发送 {len(request_configs)} 个并发请求")
         
         unique_id = int(time.time() * 1000)
         current_timestamp = int(time.time())
@@ -734,10 +803,247 @@ def handle_request():
                 # 确保立即刷新
                 time.sleep(0.1)
                 
-                # 生成图像流
-                for chunk in generate_image_stream(unique_id, current_timestamp, body["model"], 
-                                                 prompt, new_url, new_request_body, headers):
-                    yield chunk
+                # 提示信息
+                prompt_payload = {
+                    "id": unique_id,
+                    "object": "chat.completion.chunk",
+                    "created": current_timestamp,
+                    "model": body["model"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": f"```\n{{\n  \"prompt\":\"{safe_prompt}\",\n  \"count\":{final_count}\n}}\n```\n"
+                            }
+                        }
+                    ],
+                    "finish_reason": None
+                }
+                yield f"data: {json.dumps(prompt_payload)}\n\n"
+                
+                # 等待一小段时间，确保客户端收到提示信息
+                time.sleep(0.5)
+                
+                # 任务进行中
+                task_payload = {
+                    "id": unique_id,
+                    "object": "chat.completion.chunk",
+                    "created": current_timestamp,
+                    "model": body["model"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": f"> 正在生成 {final_count} 张图片..."
+                            }
+                        }
+                    ],
+                    "finish_reason": None
+                }
+                yield f"data: {json.dumps(task_payload)}\n\n"
+                
+                # 等待一小段时间，确保客户端收到进行中信息
+                time.sleep(0.5)
+                
+                # 使用线程池并发请求
+                import concurrent.futures
+                
+                def make_request(config):
+                    try:
+                        logger.info(f"发送请求 #{config['index']+1} 到: {config['url']}")
+                        logger.info(f"使用API密钥: {config['headers']['Authorization'][:15]}...")
+                        response = requests.post(
+                            config['url'], 
+                            json=config['body'], 
+                            headers=config['headers'],
+                            timeout=60  # 增加超时时间
+                        )
+                        return {
+                            "index": config['index'],
+                            "status_code": response.status_code,
+                            "response": response.json() if response.status_code == 200 else {"error": response.text}
+                        }
+                    except Exception as e:
+                        logger.error(f"请求 #{config['index']+1} 失败: {str(e)}")
+                        return {
+                            "index": config['index'],
+                            "status_code": 500,
+                            "response": {"error": str(e)}
+                        }
+                
+                # 创建线程池
+                with concurrent.futures.ThreadPoolExecutor(max_workers=final_count) as executor:
+                    # 提交所有请求
+                    future_to_config = {executor.submit(make_request, config): config for config in request_configs}
+                    
+                    # 处理完成的请求
+                    for i, future in enumerate(concurrent.futures.as_completed(future_to_config)):
+                        config = future_to_config[future]
+                        try:
+                            result = future.result()
+                            logger.info(f"请求 #{result['index']+1} 完成，状态码: {result['status_code']}")
+                            
+                            # 处理响应
+                            if result['status_code'] == 200:
+                                response_body = result['response']
+                                
+                                # 检查响应中是否包含图像URL
+                                if isinstance(response_body, dict) and "images" in response_body and response_body["images"]:
+                                    # 确保images是列表且包含字典元素
+                                    if isinstance(response_body["images"], list) and len(response_body["images"]) > 0:
+                                        image_item = response_body["images"][0]
+                                        if isinstance(image_item, dict) and "url" in image_item:
+                                            image_url = image_item["url"]
+                                            logger.info(f"请求 #{result['index']+1} 接收到的 imageURL: {image_url}")
+                                            
+                                            # 生成短链接
+                                            short_url = generate_short_url(image_url)
+                                            
+                                            # 上传到蓝空图床
+                                            lsky_url = upload_to_lsky_pro(image_url)
+                                            
+                                            # 构建响应文本
+                                            if lsky_url:
+                                                image_text = f"\n\n图片 #{result['index']+1}/{final_count} 生成完成 ✅\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n蓝空图床链接(永久有效)：{lsky_url}\n\n![image{result['index']+1}|{safe_prompt}]({lsky_url})"
+                                            else:
+                                                image_text = f"\n\n图片 #{result['index']+1}/{final_count} 生成完成 ✅\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n![image{result['index']+1}|{safe_prompt}]({short_url})"
+                                            
+                                            # 发送图片结果
+                                            image_payload = {
+                                                "id": unique_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": current_timestamp,
+                                                "model": body["model"],
+                                                "choices": [
+                                                    {
+                                                        "index": 0,
+                                                        "delta": {
+                                                            "content": image_text
+                                                        }
+                                                    }
+                                                ],
+                                                "finish_reason": None
+                                            }
+                                            yield f"data: {json.dumps(image_payload)}\n\n"
+                                        else:
+                                            logger.error(f"请求 #{result['index']+1} 图像项格式错误: {image_item}")
+                                            error_text = f"\n\n图片 #{result['index']+1}/{final_count} 生成失败 ❌ - 图像格式错误"
+                                            error_payload = {
+                                                "id": unique_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": current_timestamp,
+                                                "model": body["model"],
+                                                "choices": [
+                                                    {
+                                                        "index": 0,
+                                                        "delta": {
+                                                            "content": error_text
+                                                        }
+                                                    }
+                                                ],
+                                                "finish_reason": None
+                                            }
+                                            yield f"data: {json.dumps(error_payload)}\n\n"
+                                    else:
+                                        logger.error(f"请求 #{result['index']+1} 图像列表格式错误: {response_body['images']}")
+                                        error_text = f"\n\n图片 #{result['index']+1}/{final_count} 生成失败 ❌ - 图像列表格式错误"
+                                        error_payload = {
+                                            "id": unique_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": current_timestamp,
+                                            "model": body["model"],
+                                            "choices": [
+                                                {
+                                                    "index": 0,
+                                                    "delta": {
+                                                        "content": error_text
+                                                    }
+                                                }
+                                            ],
+                                            "finish_reason": None
+                                        }
+                                        yield f"data: {json.dumps(error_payload)}\n\n"
+                                else:
+                                    error_msg = "未知错误"
+                                    if isinstance(response_body, dict) and "message" in response_body:
+                                        error_msg = str(response_body["message"])
+                                    logger.error(f"请求 #{result['index']+1} 画图失败：{response_body}")
+                                    error_text = f"\n\n图片 #{result['index']+1}/{final_count} 生成失败 ❌ - {error_msg}"
+                                    error_payload = {
+                                        "id": unique_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": current_timestamp,
+                                        "model": body["model"],
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": {
+                                                    "content": error_text
+                                                }
+                                            }
+                                        ],
+                                        "finish_reason": None
+                                    }
+                                    yield f"data: {json.dumps(error_payload)}\n\n"
+                            else:
+                                logger.error(f"请求 #{result['index']+1} 返回错误状态码: {result['status_code']}")
+                                error_text = f"\n\n图片 #{result['index']+1}/{final_count} 生成失败 ❌ - 服务器返回错误: {result['status_code']}"
+                                error_payload = {
+                                    "id": unique_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": current_timestamp,
+                                    "model": body["model"],
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {
+                                                "content": error_text
+                                            }
+                                        }
+                                    ],
+                                    "finish_reason": None
+                                }
+                                yield f"data: {json.dumps(error_payload)}\n\n"
+                        except Exception as e:
+                            logger.error(f"处理请求 #{config['index']+1} 结果时出错: {str(e)}")
+                            error_text = f"\n\n图片 #{config['index']+1}/{final_count} 生成失败 ❌ - 处理结果时出错: {str(e)}"
+                            error_payload = {
+                                "id": unique_id,
+                                "object": "chat.completion.chunk",
+                                "created": current_timestamp,
+                                "model": body["model"],
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "content": error_text
+                                        }
+                                    }
+                                ],
+                                "finish_reason": None
+                            }
+                            yield f"data: {json.dumps(error_payload)}\n\n"
+                
+                # 所有图片处理完成
+                completion_payload = {
+                    "id": unique_id,
+                    "object": "chat.completion.chunk",
+                    "created": current_timestamp,
+                    "model": body["model"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": f"\n\n所有 {final_count} 张图片处理完成。"
+                            }
+                        }
+                    ],
+                    "finish_reason": None
+                }
+                yield f"data: {json.dumps(completion_payload)}\n\n"
+                
+                # 结束响应
+                yield "data: [DONE]\n\n"
             
             return Response(
                 stream_with_context(generate()),
@@ -749,14 +1055,15 @@ def handle_request():
                 }
             )
         
-        # 非流式响应
+        # 非流式响应 - 只返回第一张图片的结果
         else:
             try:
-                logger.info(f"发送请求到: {new_url}")
-                logger.info(f"请求头: {headers}")
-                logger.info(f"请求体: {new_request_body}")
+                config = request_configs[0]
+                logger.info(f"发送请求到: {config['url']}")
+                logger.info(f"请求头: {config['headers']}")
+                logger.info(f"请求体: {config['body']}")
                 
-                response = requests.post(new_url, json=new_request_body, headers=headers)
+                response = requests.post(config['url'], json=config['body'], headers=config['headers'])
                 
                 logger.info(f"API响应状态码: {response.status_code}")
                 logger.info(f"API响应内容: {response.text[:200]}...")
@@ -784,12 +1091,12 @@ def handle_request():
                             lsky_url = upload_to_lsky_pro(image_url)
                             
                             # 构建响应文本
-                            escaped_prompt = json.dumps(prompt)[1:-1]  # 使用json.dumps处理转义
+                            escaped_prompt = json.dumps(safe_prompt)[1:-1]  # 使用json.dumps处理转义
                             
                             if lsky_url:
-                                response_text = f"\n{{\n \"prompt\":\"{escaped_prompt}\",\n \"image_size\": \"{image_size}\"\n}}\n\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n蓝空图床链接(永久有效)：{lsky_url}\n\n![{prompt}]({lsky_url})"
+                                response_text = f"\n{{\n \"prompt\":\"{escaped_prompt}\",\n \"image_size\": \"{image_size}\",\n \"count\": {final_count}\n}}\n\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n蓝空图床链接(永久有效)：{lsky_url}\n\n![image1|{safe_prompt}]({lsky_url})"
                             else:
-                                response_text = f"\n{{\n \"prompt\":\"{escaped_prompt}\",\n \"image_size\": \"{image_size}\"\n}}\n\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n![{prompt}]({short_url})"
+                                response_text = f"\n{{\n \"prompt\":\"{escaped_prompt}\",\n \"image_size\": \"{image_size}\",\n \"count\": {final_count}\n}}\n\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n![image1|{safe_prompt}]({short_url})"
                             
                             return jsonify(send_response(body, response_text))
                         else:
@@ -826,6 +1133,9 @@ if __name__ == "__main__":
     # 获取图像提示模型
     image_prompt_model = get_env("IMAGE_PROMPT_MODEL", "Qwen/Qwen2.5-7B-Instruct")
     
+    # 获取最大图片数量
+    max_images = get_env_int("MAX_IMAGES_PER_REQUEST", 4)
+    
     # 获取API密钥
     service_api_key = get_env("API_KEY", "")
     if service_api_key:
@@ -856,9 +1166,10 @@ if __name__ == "__main__":
     else:
         logger.info("蓝空图床未启用")
     
-    logger.info(f"服务配置: 端口={port}, 模型={image_prompt_model}")
+    logger.info(f"服务配置: 端口={port}, 模型={image_prompt_model}, 最大图片数量={max_images}")
     logger.info(f"关键词过滤: {get_env('BANNED_KEYWORDS', '')}")
     logger.info(f"支持的模型数量: {len(SUPPORTED_MODELS)}")
     
     # 启动服务
     app.run(host="0.0.0.0", port=port)
+
