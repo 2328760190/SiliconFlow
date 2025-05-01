@@ -25,7 +25,7 @@ curl -X POST http://localhost:7860/v1/chat/completions \
 ### 2️⃣ 多图片生成 (pic:number)
 
 使用 `pic:number` 语法可以一次性生成多张图片，节省时间和操作步骤。
-
+冷知识，你可以根据失败图片编号判断哪一个keys失效
 ```plaintext
 画一只可爱的猫咪，9:16比例 pic:3
 ```
