@@ -360,7 +360,7 @@ def generate_image_stream(unique_id: int, current_timestamp: int, model: str, pr
             {
                 "index": 0,
                 "delta": {
-                    "content": f"\`\`\`\n{{\n  \"prompt\":\"{prompt}\"\n}}\n\`\`\`\n"
+                    "content": f"```\n{{\n  \"prompt\":\"{prompt}\"\n}}\n```\n"
                 }
             }
         ],
