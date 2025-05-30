@@ -41,7 +41,7 @@ jobs:
         with:
           registry: ghcr.io
           username: 2328760190
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.TOKEN }}
           
       - name: Build and push AMD64 image
         uses: docker/build-push-action@v4
