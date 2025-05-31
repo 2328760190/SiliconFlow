@@ -11,4 +11,4 @@ COPY . .
 EXPOSE 7860
 
 # 启动服务
-CMD ["python", "/app/main.py"]
+CMD ["python", "main.py"]
