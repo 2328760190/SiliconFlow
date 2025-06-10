@@ -1203,5 +1203,677 @@ def handle_request():
                         "created": int(time.time()),
                         "model": body["model"],
                         "choices": [{"index": 0, "message": {"role": "assistant", "content": response_text}, "logprobs": None, "finish_reason": "stop"}],
-                        "usage": {"prompt_tokens": len(body["messages"][-1]["content"]),
+                        "usage": {"prompt_tokens": len(body["messages"][-1]["content"]),  "completion_tokens": len(response_text), "total_tokens": len(body["messages"][-1]["content"]) + len(response_text)}
+                    })
+            
+            except Exception as e:
+                logger.error(f"Error: {str(e)}")
+                return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
+    
+    except Exception as e:
+        logger.error(f"Request handling error: {str(e)}")
+        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
 
+@app.route("/health", methods=["GET"])
+def health_check():
+    """健康检查端点"""
+    return "OK", 200
+
+# HTML模板
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>管理员登录</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @keyframes gradient {
+            0% {background-position: 0% 50%;}
+            50% {background-position: 100% 50%;}
+            100% {background-position: 0% 50%;}
+        }
+        .animated-bg {
+            background: linear-gradient(-45deg, #667eea, #764ba2, #f093fb, #f5576c);
+            background-size: 400% 400%;
+            animation: gradient 15s ease infinite;
+        }
+    </style>
+</head>
+<body class="animated-bg min-h-screen flex items-center justify-center">
+    <div class="bg-white p-8 rounded-xl shadow-2xl max-w-md w-full backdrop-blur-md bg-opacity-90">
+        <div class="text-center mb-8">
+            <h1 class="text-3xl font-bold text-gray-800 mb-2">管理员登录</h1>
+            <p class="text-gray-600">图像生成服务管理中心</p>
+        </div>
+        <form id="loginForm" class="space-y-6">
+            <div>
+                <label for="username" class="block text-sm font-medium text-gray-700 mb-2">用户名</label>
+                <input type="text" id="username" name="username" required 
+                       class="w-full px-4 py-3 rounded-lg border border-gray-300 focus:ring-2 focus:ring-blue-500 focus:border-transparent transition duration-200">
+            </div>
+            <div>
+                <label for="password" class="block text-sm font-medium text-gray-700 mb-2">密码</label>
+                <input type="password" id="password" name="password" required 
+                       class="w-full px-4 py-3 rounded-lg border border-gray-300 focus:ring-2 focus:ring-blue-500 focus:border-transparent transition duration-200">
+            </div>
+            <button type="submit" 
+                    class="w-full bg-gradient-to-r from-blue-600 to-purple-600 text-white font-bold py-3 px-4 rounded-lg hover:from-blue-700 hover:to-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition duration-300 ease-in-out transform hover:-translate-y-1 hover:scale-105">
+                登录
+            </button>
+        </form>
+        <div class="mt-6 text-center text-sm text-gray-600">
+            默认用户名: admin, 密码: admin123
+        </div>
+    </div>
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+
+            try {
+                const response = await fetch('/admin/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+
+                const result = await response.json();
+                if (result.success) {
+                    window.location.href = '/admin';
+                } else {
+                    alert('登录失败: ' + result.message);
+                }
+            } catch (error) {
+                alert('登录失败: ' + error.message);
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+ADMIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>管理员面板</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+    <style>
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .gradient-bg {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen" x-data="adminApp()">
+    <!-- 顶部导航 -->
+    <nav class="gradient-bg shadow-lg">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between h-16">
+                <div class="flex items-center">
+                    <h1 class="text-xl font-bold text-white">图像生成服务管理中心</h1>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <span class="text-white text-sm" x-text="'存储方式: ' + status.config_source"></span>
+                    <a href="/admin/logout" class="text-white hover:text-gray-200 transition duration-200">退出</a>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <div class="max-w-7xl mx-auto py-6 px-4 sm:px-6 lg:px-8">
+        <!-- 状态卡片 -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+            <div class="bg-white overflow-hidden shadow rounded-lg">
+                <div class="p-5">
+                    <div class="flex items-center">
+                        <div class="flex-shrink-0">
+                            <div class="w-8 h-8 bg-green-500 rounded-full flex items-center justify-center">
+                                <span class="text-white text-sm font-bold">✓</span>
+                            </div>
+                        </div>
+                        <div class="ml-5 w-0 flex-1">
+                            <dl>
+                                <dt class="text-sm font-medium text-gray-500 truncate">存储状态</dt>
+                                <dd class="text-lg font-medium text-gray-900" x-text="status.config_source"></dd>
+                            </dl>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="bg-white overflow-hidden shadow rounded-lg">
+                <div class="p-5">
+                    <div class="flex items-center">
+                        <div class="flex-shrink-0">
+                            <div class="w-8 h-8 bg-blue-500 rounded-full flex items-center justify-center">
+                                <span class="text-white text-sm font-bold">#</span>
+                            </div>
+                        </div>
+                        <div class="ml-5 w-0 flex-1">
+                            <dl>
+                                <dt class="text-sm font-medium text-gray-500 truncate">服务商数量</dt>
+                                <dd class="text-lg font-medium text-gray-900" x-text="status.providers_count"></dd>
+                            </dl>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="bg-white overflow-hidden shadow rounded-lg">
+                <div class="p-5">
+                    <div class="flex items-center">
+                        <div class="flex-shrink-0">
+                            <div class="w-8 h-8 bg-purple-500 rounded-full flex items-center justify-center">
+                                <span class="text-white text-sm font-bold">K</span>
+                            </div>
+                        </div>
+                        <div class="ml-5 w-0 flex-1">
+                            <dl>
+                                <dt class="text-sm font-medium text-gray-500 truncate">用户Key数量</dt>
+                                <dd class="text-lg font-medium text-gray-900" x-text="userKeys.length"></dd>
+                            </dl>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-white overflow-hidden shadow rounded-lg">
+                <div class="p-5">
+                    <div class="flex items-center">
+                        <div class="flex-shrink-0">
+                            <div class="w-8 h-8 bg-indigo-500 rounded-full flex items-center justify-center">
+                                <span class="text-white text-sm font-bold">API</span>
+                            </div>
+                        </div>
+                        <div class="ml-5 w-0 flex-1">
+                            <dl>
+                                <dt class="text-sm font-medium text-gray-500 truncate">API接口</dt>
+                                <dd class="text-lg font-medium text-gray-900">已启用</dd>
+                            </dl>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 标签页导航 -->
+        <div class="bg-white shadow rounded-lg">
+            <div class="border-b border-gray-200">
+                <nav class="-mb-px flex space-x-8 px-6" aria-label="Tabs">
+                    <button @click="activeTab = 'admin-config'" 
+                            :class="activeTab === 'admin-config' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                            class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm transition duration-200">
+                        管理员配置
+                    </button>
+                    <button @click="activeTab = 'user-keys'" 
+                            :class="activeTab === 'user-keys' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                            class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm transition duration-200">
+                        用户Key管理
+                    </button>
+                    <button @click="activeTab = 'permissions'" 
+                            :class="activeTab === 'permissions' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                            class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm transition duration-200">
+                        权限配置
+                    </button>
+                    <button @click="activeTab = 'providers'" 
+                            :class="activeTab === 'providers' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'"
+                            class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm transition duration-200">
+                        服务商管理
+                    </button>
+                </nav>
+            </div>
+
+            <!-- 管理员配置 -->
+            <div x-show="activeTab === 'admin-config'" class="p-6">
+                <h2 class="text-lg font-medium text-gray-900 mb-6">管理员配置</h2>
+                <form @submit.prevent="saveAdminConfig" class="space-y-6">
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">用户名</label>
+                            <input type="text" x-model="adminConfig.username" required
+                                   class="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">密码</label>
+                            <input type="password" x-model="adminConfig.password" required
+                                   class="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                    </div>
+                    
+                    <button type="submit" 
+                            class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md text-sm font-medium transition duration-200">
+                        保存配置
+                    </button>
+                </form>
+            </div>
+
+            <!-- 用户Key管理 -->
+            <div x-show="activeTab === 'user-keys'" class="p-6">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-lg font-medium text-gray-900">用户Key管理</h2>
+                    <button @click="showAddUserKey = true" 
+                            class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md text-sm font-medium transition duration-200">
+                        添加用户Key
+                    </button>
+                </div>
+
+                <!-- 用户Key列表 -->
+                <div class="overflow-hidden shadow ring-1 ring-black ring-opacity-5 md:rounded-lg">
+                    <table class="min-w-full divide-y divide-gray-300">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">名称</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Key</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">等级</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">使用次数</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                            <template x-for="userKey in userKeys" :key="userKey.id">
+                                <tr>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900" x-text="userKey.name"></td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 font-mono" x-text="userKey.key.substring(0, 20) + '...'"></td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                        <span :class="userKey.level === 'admin' ? 'bg-red-100 text-red-800' : 'bg-blue-100 text-blue-800'" 
+                                              class="inline-flex px-2 py-1 text-xs font-semibold rounded-full" 
+                                              x-text="userKey.level === 'admin' ? '管理员' : '用户'"></span>
+                                    </td>
+                                    <td class="px-6 py-4 whitespace-nowrap">
+                                        <span :class="userKey.enabled ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'" 
+                                              class="inline-flex px-2 py-1 text-xs font-semibold rounded-full" 
+                                              x-text="userKey.enabled ? '启用' : '禁用'"></span>
+                                    </td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="userKey.usage_count || 0"></td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                                        <button @click="editUserKey(userKey.id)" class="text-blue-600 hover:text-blue-900 mr-3">编辑</button>
+                                        <button @click="deleteUserKey(userKey.id)" class="text-red-600 hover:text-red-900">删除</button>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 权限配置 -->
+            <div x-show="activeTab === 'permissions'" class="p-6">
+                <h2 class="text-lg font-medium text-gray-900 mb-6">API端点权限配置</h2>
+                <form @submit.prevent="savePermissions" class="space-y-4">
+                    <template x-for="(level, endpoint) in permissions" :key="endpoint">
+                        <div class="flex items-center justify-between p-4 border border-gray-200 rounded-lg">
+                            <div>
+                                <span class="font-medium text-gray-900" x-text="endpoint"></span>
+                                <p class="text-sm text-gray-500" x-text="getEndpointDescription(endpoint)"></p>
+                            </div>
+                            <select x-model="permissions[endpoint]" 
+                                    class="px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500">
+                                <option value="guest">访客</option>
+                                <option value="user">用户</option>
+                                <option value="admin">管理员</option>
+                            </select>
+                        </div>
+                    </template>
+                    
+                    <button type="submit" 
+                            class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md text-sm font-medium transition duration-200">
+                        保存权限配置
+                    </button>
+                </form>
+            </div>
+
+            <!-- 服务商管理 -->
+            <div x-show="activeTab === 'providers'" class="p-6">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-lg font-medium text-gray-900">服务商管理</h2>
+                    <button @click="showAddProvider = true" 
+                            class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md text-sm font-medium transition duration-200">
+                        添加服务商
+                    </button>
+                </div>
+
+                <!-- 服务商列表 -->
+                <div class="overflow-hidden shadow ring-1 ring-black ring-opacity-5 md:rounded-lg">
+                    <table class="min-w-full divide-y divide-gray-300">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">名称</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">类型</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">地址</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">密钥数</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">模型数</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                            <template x-for="provider in providers" :key="provider.id">
+                                <tr>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900" x-text="provider.name"></td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="getProviderTypeName(provider.provider_type)"></td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="provider.base_url"></td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="provider.api_keys_count"></td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="provider.models_count"></td>
+                                    <td class="px-6 py-4 whitespace-nowrap">
+                                        <span :class="provider.enabled ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'" 
+                                              class="inline-flex px-2 py-1 text-xs font-semibold rounded-full" 
+                                              x-text="provider.enabled ? '启用' : '禁用'"></span>
+                                    </td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                                        <button @click="editProvider(provider.id)" class="text-blue-600 hover:text-blue-900 mr-3">编辑</button>
+                                        <button @click="deleteProvider(provider.id)" class="text-red-600 hover:text-red-900">删除</button>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 添加用户Key模态框 -->
+    <div x-show="showAddUserKey" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50" 
+         x-transition:enter="ease-out duration-300" x-transition:enter-start="opacity-0" x-transition:enter-end="opacity-100"
+         x-transition:leave="ease-in duration-200" x-transition:leave-start="opacity-100" x-transition:leave-end="opacity-0">
+        <div class="relative top-20 mx-auto p-5 border w-11/12 md:w-3/4 lg:w-1/2 shadow-lg rounded-md bg-white">
+            <div class="mt-3">
+                <h3 class="text-lg font-medium text-gray-900 mb-4" x-text="editingUserKey ? '编辑用户Key' : '添加用户Key'"></h3>
+                <form @submit.prevent="saveUserKey" class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">名称</label>
+                        <input type="text" x-model="userKeyForm.name" required 
+                               class="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500">
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">权限等级</label>
+                        <select x-model="userKeyForm.level" 
+                                class="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500">
+                            <option value="user">用户</option>
+                            <option value="admin">管理员</option>
+                        </select>
+                    </div>
+                    
+                    <div class="flex items-center">
+                        <input type="checkbox" x-model="userKeyForm.enabled" 
+                               class="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded">
+                        <label class="ml-2 block text-sm text-gray-900">启用此Key</label>
+                    </div>
+                    
+                    <div class="flex justify-end space-x-3 pt-4">
+                        <button type="button" @click="closeUserKeyModal" 
+                                class="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-200 rounded-md hover:bg-gray-300 transition duration-200">
+                            取消
+                        </button>
+                        <button type="submit" 
+                                class="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700 transition duration-200">
+                            保存
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function adminApp() {
+            return {
+                activeTab: 'admin-config',
+                status: {},
+                adminConfig: {
+                    username: '',
+                    password: ''
+                },
+                userKeys: [],
+                permissions: {},
+                providers: [],
+                showAddUserKey: false,
+                showAddProvider: false,
+                editingUserKey: null,
+                userKeyForm: {
+                    name: '',
+                    level: 'user',
+                    enabled: true
+                },
+
+                async init() {
+                    await this.loadStatus();
+                    await this.loadAdminConfig();
+                    await this.loadUserKeys();
+                    await this.loadPermissions();
+                    await this.loadProviders();
+                },
+
+                getEndpointDescription(endpoint) {
+                    const descriptions = {
+                        '/v1/models': '获取模型列表',
+                        '/v1/chat/completions': '聊天完成接口',
+                        '/v1/images/generations': 'OpenAI图像生成接口',
+                        '/gen': '简单图像生成接口',
+                        '/admin': '管理员面板',
+                        '/config': '配置管理'
+                    };
+                    return descriptions[endpoint] || '未知接口';
+                },
+
+                getProviderTypeName(type) {
+                    const names = {
+                        'native': '本项目对接',
+                        'openai_adapter': 'OpenAI适配器',
+                        'fal_ai': 'Fal.ai适配器'
+                    };
+                    return names[type] || type;
+                },
+
+                async loadStatus() {
+                    try {
+                        const response = await fetch('/admin/api/status');
+                        this.status = await response.json();
+                    } catch (error) {
+                        console.error('加载状态失败:', error);
+                    }
+                },
+
+                async loadAdminConfig() {
+                    try {
+                        const response = await fetch('/admin/api/admin-config');
+                        this.adminConfig = await response.json();
+                    } catch (error) {
+                        console.error('加载管理员配置失败:', error);
+                    }
+                },
+
+                async saveAdminConfig() {
+                    try {
+                        const response = await fetch('/admin/api/admin-config', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(this.adminConfig)
+                        });
+                        
+                        const result = await response.json();
+                        if (result.success) {
+                            alert('管理员配置保存成功');
+                        } else {
+                            alert('保存失败');
+                        }
+                    } catch (error) {
+                        alert('保存失败: ' + error.message);
+                    }
+                },
+
+                async loadUserKeys() {
+                    try {
+                        const response = await fetch('/admin/api/user-keys');
+                        this.userKeys = await response.json();
+                    } catch (error) {
+                        console.error('加载用户Key失败:', error);
+                    }
+                },
+
+                async saveUserKey() {
+                    try {
+                        const url = this.editingUserKey ? 
+                            `/admin/api/user-keys/${this.editingUserKey}` : 
+                            '/admin/api/user-keys';
+                        const method = this.editingUserKey ? 'PUT' : 'POST';
+                        
+                        const response = await fetch(url, {
+                            method: method,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(this.userKeyForm)
+                        });
+                        
+                        const result = await response.json();
+                        if (result.success) {
+                            await this.loadUserKeys();
+                            this.closeUserKeyModal();
+                            if (result.key) {
+                                alert(`用户Key创建成功！\n\nKey: ${result.key}\n\n请妥善保存此Key，它不会再次显示。`);
+                            } else {
+                                alert('用户Key更新成功');
+                            }
+                        } else {
+                            alert('操作失败: ' + result.message);
+                        }
+                    } catch (error) {
+                        alert('操作失败: ' + error.message);
+                    }
+                },
+
+                async editUserKey(keyId) {
+                    const userKey = this.userKeys.find(uk => uk.id === keyId);
+                    if (userKey) {
+                        this.userKeyForm = {
+                            name: userKey.name,
+                            level: userKey.level,
+                            enabled: userKey.enabled
+                        };
+                        this.editingUserKey = keyId;
+                        this.showAddUserKey = true;
+                    }
+                },
+
+                async deleteUserKey(keyId) {
+                    if (!confirm('确定要删除这个用户Key吗？')) return;
+                    
+                    try {
+                        const response = await fetch(`/admin/api/user-keys/${keyId}`, {
+                            method: 'DELETE'
+                        });
+                        
+                        const result = await response.json();
+                        if (result.success) {
+                            await this.loadUserKeys();
+                            alert('用户Key删除成功');
+                        } else {
+                            alert('删除失败: ' + result.message);
+                        }
+                    } catch (error) {
+                        alert('删除失败: ' + error.message);
+                    }
+                },
+
+                closeUserKeyModal() {
+                    this.showAddUserKey = false;
+                    this.editingUserKey = null;
+                    this.userKeyForm = {
+                        name: '',
+                        level: 'user',
+                        enabled: true
+                    };
+                },
+
+                async loadPermissions() {
+                    try {
+                        const response = await fetch('/admin/api/permissions');
+                        this.permissions = await response.json();
+                    } catch (error) {
+                        console.error('加载权限配置失败:', error);
+                    }
+                },
+
+                async savePermissions() {
+                    try {
+                        const response = await fetch('/admin/api/permissions', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(this.permissions)
+                        });
+                        
+                        const result = await response.json();
+                        if (result.success) {
+                            alert('权限配置保存成功');
+                        } else {
+                            alert('保存失败');
+                        }
+                    } catch (error) {
+                        alert('保存失败: ' + error.message);
+                    }
+                },
+
+                async loadProviders() {
+                    try {
+                        const response = await fetch('/admin/api/providers');
+                        this.providers = await response.json();
+                    } catch (error) {
+                        console.error('加载服务商失败:', error);
+                    }
+                }
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    # 获取系统配置
+    system_config = config_manager.get_system_config()
+    
+    logger.info("=== 图像生成服务启动 ===")
+    logger.info(f"配置存储方式: {config_manager.config_source}")
+    logger.info(f"服务端口: {system_config.port}")
+    logger.info(f"管理员面板: http://localhost:{system_config.port}/admin")
+    logger.info(f"最大图片数量: {system_config.max_images_per_request}")
+    
+    # 检查服务商配置
+    providers = config_manager.get_all_providers()
+    if providers:
+        for provider in providers:
+            status = "启用" if provider.enabled else "禁用"
+            logger.info(f"服务商: {provider.name} ({provider.provider_type.value}) - {status}")
+    else:
+        logger.warning("未配置任何服务商，请访问管理员面板进行配置")
+    
+    # 检查各项配置
+    ai_config = config_manager.get_ai_prompt_config()
+    if ai_config.enabled:
+        logger.info("AI提示词增强已启用")
+    
+    hosting_config = config_manager.get_image_hosting_config()
+    if hosting_config.enabled:
+        logger.info("蓝空图床已启用")
+    
+    shortlink_config = config_manager.get_shortlink_config()
+    if shortlink_config.enabled:
+        logger.info("短链接服务已启用")
+    
+    # 显示权限配置
+    permissions = config_manager.get_endpoint_permissions()
+    logger.info("API权限配置:")
+    for endpoint, level in permissions.items():
+        logger.info(f"  {endpoint}: {level}")
+    
+    # 启动服务
+    app.run(host="0.0.0.0", port=system_config.port)
