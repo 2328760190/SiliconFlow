@@ -65,7 +65,7 @@ class ServiceProvider:
 @dataclass
 class AIPromptConfig:
     enabled: bool = True
-    model: str = "Qwen/Qwen2.5-7B-Instruct"
+    model: str = "Qwen/Qwen3-8B"
     api_url: str = "http://localhost:3000/v1/chat/completions"
     api_key: str = ""
     system_prompt: str = "你是一个技术精湛、善于观察、富有创造力和想象力、擅长使用精准语言描述画面的艺术家。请根据用户的作画请求（可能是一组包含绘画要求的上下文，跳过其中的非绘画内容），扩充为一段具体的画面描述，100 words以内。可以包括画面内容、风格、技法等，使用英文回复."
