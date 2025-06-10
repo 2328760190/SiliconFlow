@@ -1,8 +1,10 @@
 ### SiliconFlow (硅基流动) 功能概览
 
-## 详细使用说明见 [使用说明.md](https://github.com/2328760190/SiliconFlow/blob/main/%E4%BD%BF%E7%94%A8%E8%AF%B4%E6%98%8E.md)
+## 详细使用说明见，没空介绍，有什么功能自己试试 [使用说明.md](https://github.com/2328760190/SiliconFlow/blob/main/%E4%BD%BF%E7%94%A8%E8%AF%B4%E6%98%8E.md)
 
-
+# 访问管理员面板
+http://localhost:7860/admin
+# 默认用户名: admin, 密码: admin123
 
 ## 🌟 核心功能
 
