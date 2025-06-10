@@ -9,12 +9,13 @@ import secrets
 import base64
 import io
 import hashlib
+from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 
 import requests
-from flask import Flask, request, Response, jsonify, stream_with_context, render_template_string, session, redirect, url_for
+from flask import Flask, request, Response, jsonify, stream_with_context, render_template_string, session, redirect, url_for, make_response
 
 # 导入配置管理器和适配器
 from config_manager import config_manager, ServiceProvider, ProviderType, UserKey, AdminConfig
@@ -29,6 +30,80 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
+
+# Cookie会话管理
+class SessionManager:
+    def __init__(self):
+        self.sessions = {}  # session_id -> {user_id, created_at, expires_at, permissions}
+    
+    def create_session(self, user_id: str, permissions: str = "admin") -> str:
+        """创建新的会话"""
+        session_id = secrets.token_urlsafe(32)
+        now = datetime.now()
+        expires_at = now + timedelta(days=3)
+        
+        self.sessions[session_id] = {
+            "user_id": user_id,
+            "created_at": now.isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "permissions": permissions,
+            "last_activity": now.isoformat()
+        }
+        
+        # 清理过期会话
+        self._cleanup_expired_sessions()
+        
+        logger.info(f"创建新会话: {session_id[:8]}... 用户: {user_id}, 过期时间: {expires_at}")
+        return session_id
+    
+    def validate_session(self, session_id: str) -> Optional[Dict]:
+        """验证会话有效性"""
+        if not session_id or session_id not in self.sessions:
+            return None
+        
+        session_data = self.sessions[session_id]
+        expires_at = datetime.fromisoformat(session_data["expires_at"])
+        
+        if datetime.now() > expires_at:
+            # 会话已过期
+            del self.sessions[session_id]
+            logger.info(f"会话已过期并删除: {session_id[:8]}...")
+            return None
+        
+        # 更新最后活动时间
+        session_data["last_activity"] = datetime.now().isoformat()
+        return session_data
+    
+    def revoke_session(self, session_id: str):
+        """撤销会话"""
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+            logger.info(f"会话已撤销: {session_id[:8]}...")
+    
+    def revoke_all_sessions(self):
+        """撤销所有会话（用于密码更改后）"""
+        count = len(self.sessions)
+        self.sessions.clear()
+        logger.info(f"已撤销所有会话，共 {count} 个")
+    
+    def _cleanup_expired_sessions(self):
+        """清理过期会话"""
+        now = datetime.now()
+        expired_sessions = []
+        
+        for session_id, session_data in self.sessions.items():
+            expires_at = datetime.fromisoformat(session_data["expires_at"])
+            if now > expires_at:
+                expired_sessions.append(session_id)
+        
+        for session_id in expired_sessions:
+            del self.sessions[session_id]
+        
+        if expired_sessions:
+            logger.info(f"清理了 {len(expired_sessions)} 个过期会话")
+
+# 全局会话管理器
+session_manager = SessionManager()
 
 # 权限验证装饰器
 def verify_permission(required_level: str = "guest"):
@@ -47,7 +122,15 @@ def verify_permission(required_level: str = "guest"):
             if actual_required_level == "guest":
                 return f(*args, **kwargs)
             
-            # 获取授权信息
+            # 首先检查Cookie会话（最高权限）
+            session_token = request.cookies.get('admin_session')
+            if session_token:
+                session_data = session_manager.validate_session(session_token)
+                if session_data and session_data["permissions"] == "admin":
+                    # Cookie会话有效，拥有最高权限
+                    return f(*args, **kwargs)
+            
+            # 然后检查API Key
             auth_header = request.headers.get("Authorization", "")
             api_key = None
             
@@ -63,10 +146,13 @@ def verify_permission(required_level: str = "guest"):
             if not api_key:
                 return jsonify({"error": "Unauthorized: API key required"}), 401
             
-            # 验证管理员Key
+            # 验证管理员Key（但权限低于Cookie会话）
             system_config = config_manager.get_system_config()
             if api_key == system_config.api_key and system_config.api_key:
-                # 管理员权限，允许所有操作
+                # 管理员Key不能创建其他Key或进行敏感操作
+                sensitive_endpoints = ['/admin/api/user-keys', '/admin/api/admin-config']
+                if request.endpoint in sensitive_endpoints and request.method in ['POST', 'PUT', 'DELETE']:
+                    return jsonify({"error": "Forbidden: Cookie session required for sensitive operations"}), 403
                 return f(*args, **kwargs)
             
             # 验证用户Key
@@ -90,12 +176,18 @@ def verify_permission(required_level: str = "guest"):
         return decorated_function
     return decorator
 
-def require_admin_auth(f):
-    """管理员认证装饰器"""
+def require_admin_session(f):
+    """管理员Cookie会话认证装饰器"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if 'admin_authenticated' not in session:
+        session_token = request.cookies.get('admin_session')
+        if not session_token:
             return redirect(url_for('admin_login'))
+        
+        session_data = session_manager.validate_session(session_token)
+        if not session_data or session_data["permissions"] != "admin":
+            return redirect(url_for('admin_login'))
+        
         return f(*args, **kwargs)
     decorated_function.__name__ = f.__name__
     return decorated_function
@@ -651,8 +743,21 @@ def admin_login():
         admin_config = config_manager.get_admin_config()
         
         if username == admin_config.username and password == admin_config.password:
-            session['admin_authenticated'] = True
-            return jsonify({'success': True})
+            # 创建Cookie会话
+            session_id = session_manager.create_session(username, "admin")
+            
+            response = make_response(jsonify({'success': True}))
+            response.set_cookie(
+                'admin_session', 
+                session_id,
+                max_age=3*24*60*60,  # 3天
+                httponly=True,
+                secure=False,  # 在生产环境中应设为True
+                samesite='Lax'
+            )
+            
+            logger.info(f"管理员登录成功: {username}")
+            return response
         else:
             return jsonify({'success': False, 'message': '用户名或密码错误'})
     
@@ -660,23 +765,28 @@ def admin_login():
 
 @app.route('/admin/logout')
 def admin_logout():
-    session.pop('admin_authenticated', None)
-    return redirect(url_for('admin_login'))
+    session_token = request.cookies.get('admin_session')
+    if session_token:
+        session_manager.revoke_session(session_token)
+    
+    response = make_response(redirect(url_for('admin_login')))
+    response.set_cookie('admin_session', '', expires=0)
+    return response
 
 @app.route('/admin')
-@require_admin_auth
+@require_admin_session
 def admin_dashboard():
     return render_template_string(ADMIN_TEMPLATE)
 
 # 管理员API - 获取状态
 @app.route('/admin/api/status')
-@require_admin_auth
+@require_admin_session
 def get_admin_status():
     return jsonify(config_manager.get_config_status())
 
 # 管理员API - 管理员配置
 @app.route('/admin/api/admin-config', methods=['GET'])
-@require_admin_auth
+@require_admin_session
 def get_admin_config():
     config = config_manager.get_admin_config()
     return jsonify({
@@ -685,7 +795,7 @@ def get_admin_config():
     })
 
 @app.route('/admin/api/admin-config', methods=['POST'])
-@require_admin_auth
+@require_admin_session
 def set_admin_config():
     data = request.get_json()
     config = AdminConfig(
@@ -693,11 +803,16 @@ def set_admin_config():
         password=data.get('password', 'admin123')
     )
     config_manager.set_admin_config(config)
-    return jsonify({'success': True})
+    
+    # 密码更改后撤销所有会话
+    session_manager.revoke_all_sessions()
+    logger.info("管理员密码已更改，所有会话已撤销")
+    
+    return jsonify({'success': True, 'message': '配置已保存，所有会话已撤销，请重新登录'})
 
 # 管理员API - 用户Key管理
 @app.route('/admin/api/user-keys', methods=['GET'])
-@require_admin_auth
+@require_admin_session
 def get_user_keys():
     user_keys = config_manager.get_all_user_keys()
     return jsonify([{
@@ -712,7 +827,7 @@ def get_user_keys():
     } for uk in user_keys])
 
 @app.route('/admin/api/user-keys', methods=['POST'])
-@require_admin_auth
+@require_admin_session
 def add_user_key():
     data = request.get_json()
     
@@ -729,12 +844,13 @@ def add_user_key():
     )
     
     if config_manager.add_user_key(user_key):
+        logger.info(f"创建用户Key: {data['name']} ({data.get('level', 'user')})")
         return jsonify({'success': True, 'key': api_key})
     else:
         return jsonify({'success': False, 'message': '添加用户Key失败'})
 
 @app.route('/admin/api/user-keys/<key_id>', methods=['PUT'])
-@require_admin_auth
+@require_admin_session
 def update_user_key(key_id):
     data = request.get_json()
     user_key = config_manager.get_user_key(key_id)
@@ -745,15 +861,21 @@ def update_user_key(key_id):
     user_key.name = data.get('name', user_key.name)
     user_key.level = data.get('level', user_key.level)
     user_key.enabled = data.get('enabled', user_key.enabled)
+    user_key.updated_at = datetime.now().isoformat()
     
     if config_manager.add_user_key(user_key):
+        logger.info(f"更新用户Key: {user_key.name}")
         return jsonify({'success': True})
     else:
         return jsonify({'success': False, 'message': '更新用户Key失败'})
 
 @app.route('/admin/api/user-keys/<key_id>', methods=['DELETE'])
-@require_admin_auth
+@require_admin_session
 def delete_user_key(key_id):
+    user_key = config_manager.get_user_key(key_id)
+    if user_key:
+        logger.info(f"删除用户Key: {user_key.name}")
+    
     if config_manager.delete_user_key(key_id):
         return jsonify({'success': True})
     else:
@@ -761,20 +883,21 @@ def delete_user_key(key_id):
 
 # 管理员API - 权限配置
 @app.route('/admin/api/permissions', methods=['GET'])
-@require_admin_auth
+@require_admin_session
 def get_permissions():
     return jsonify(config_manager.get_endpoint_permissions())
 
 @app.route('/admin/api/permissions', methods=['POST'])
-@require_admin_auth
+@require_admin_session
 def set_permissions():
     data = request.get_json()
     config_manager.set_endpoint_permissions(data)
+    logger.info("权限配置已更新")
     return jsonify({'success': True})
 
-# 服务商管理API（与之前类似，但添加权限验证）
+# 服务商管理API
 @app.route('/admin/api/providers', methods=['GET'])
-@require_admin_auth
+@require_admin_session
 def get_providers():
     providers = config_manager.get_all_providers()
     return jsonify([{
@@ -789,7 +912,7 @@ def get_providers():
     } for p in providers])
 
 @app.route('/admin/api/providers', methods=['POST'])
-@require_admin_auth
+@require_admin_session
 def add_provider():
     data = request.get_json()
     
@@ -807,7 +930,7 @@ def add_provider():
     default_models = config_manager.get_default_models_for_type(provider_type)
     
     # 如果用户没有指定模型，使用默认模型
-    user_models = data['models'].split(',') if data['models'] else []
+    user_models = [m.strip() for m in data['models'].split(',') if m.strip()] if data['models'] else []
     final_models = user_models if user_models else default_models
     
     provider = ServiceProvider(
@@ -815,15 +938,80 @@ def add_provider():
         name=data['name'],
         provider_type=provider_type,
         base_url=base_url,
-        api_keys=data['api_keys'].split(',') if data['api_keys'] else [],
+        api_keys=[k.strip() for k in data['api_keys'].split(',') if k.strip()] if data['api_keys'] else [],
         models=final_models,
         enabled=data.get('enabled', True)
     )
     
     if config_manager.add_provider(provider):
+        logger.info(f"添加服务商: {data['name']} ({provider_type.value})")
         return jsonify({'success': True, 'provider_id': provider_id})
     else:
         return jsonify({'success': False, 'message': '添加服务商失败'})
+
+@app.route('/admin/api/providers/<provider_id>', methods=['PUT'])
+@require_admin_session
+def update_provider(provider_id):
+    data = request.get_json()
+    provider = config_manager.get_provider(provider_id)
+    
+    if not provider:
+        return jsonify({'success': False, 'message': '服务商不存在'})
+    
+    # 更新字段
+    provider.name = data.get('name', provider.name)
+    provider.provider_type = ProviderType(data.get('provider_type', provider.provider_type.value))
+    provider.base_url = data.get('base_url', provider.base_url).rstrip('/')
+    provider.api_keys = [k.strip() for k in data.get('api_keys', '').split(',') if k.strip()] if data.get('api_keys') else provider.api_keys
+    provider.models = [m.strip() for m in data.get('models', '').split(',') if m.strip()] if data.get('models') else provider.models
+    provider.enabled = data.get('enabled', provider.enabled)
+    provider.updated_at = datetime.now().isoformat()
+    
+    if config_manager.add_provider(provider):  # add_provider也用于更新
+        logger.info(f"更新服务商: {provider.name}")
+        return jsonify({'success': True})
+    else:
+        return jsonify({'success': False, 'message': '更新服务商失败'})
+
+@app.route('/admin/api/providers/<provider_id>', methods=['DELETE'])
+@require_admin_session
+def delete_provider(provider_id):
+    provider = config_manager.get_provider(provider_id)
+    if provider:
+        logger.info(f"删除服务商: {provider.name}")
+    
+    if config_manager.delete_provider(provider_id):
+        return jsonify({'success': True})
+    else:
+        return jsonify({'success': False, 'message': '删除服务商失败'})
+
+@app.route('/admin/api/providers/<provider_id>', methods=['GET'])
+@require_admin_session
+def get_provider(provider_id):
+    provider = config_manager.get_provider(provider_id)
+    if provider:
+        return jsonify({
+            'id': provider.id,
+            'name': provider.name,
+            'provider_type': provider.provider_type.value,
+            'base_url': provider.base_url,
+            'api_keys': ','.join(provider.api_keys),
+            'models': ','.join(provider.models),
+            'enabled': provider.enabled
+        })
+    else:
+        return jsonify({'success': False, 'message': '服务商不存在'})
+
+# 获取默认模型API
+@app.route('/admin/api/default-models/<provider_type>')
+@require_admin_session
+def get_default_models(provider_type):
+    try:
+        ptype = ProviderType(provider_type)
+        models = config_manager.get_default_models_for_type(ptype)
+        return jsonify({'success': True, 'models': models})
+    except ValueError:
+        return jsonify({'success': False, 'message': '无效的服务商类型'})
 
 # 主要API路由
 @app.route("/v1/models", methods=["GET"])
@@ -1266,6 +1454,9 @@ LOGIN_TEMPLATE = """
         <div class="mt-6 text-center text-sm text-gray-600">
             默认用户名: admin, 密码: admin123
         </div>
+        <div class="mt-4 text-center text-xs text-gray-500">
+            登录后将创建3天有效期的安全会话
+        </div>
     </div>
     <script>
         document.getElementById('loginForm').addEventListener('submit', async (e) => {
@@ -1322,6 +1513,7 @@ ADMIN_TEMPLATE = """
                 </div>
                 <div class="flex items-center space-x-4">
                     <span class="text-white text-sm" x-text="'存储方式: ' + status.config_source"></span>
+                    <span class="text-white text-xs">Cookie会话模式</span>
                     <a href="/admin/logout" class="text-white hover:text-gray-200 transition duration-200">退出</a>
                 </div>
             </div>
@@ -1360,7 +1552,7 @@ ADMIN_TEMPLATE = """
                         <div class="ml-5 w-0 flex-1">
                             <dl>
                                 <dt class="text-sm font-medium text-gray-500 truncate">服务商数量</dt>
-                                <dd class="text-lg font-medium text-gray-900" x-text="status.providers_count"></dd>
+                                <dd class="text-lg font-medium text-gray-900" x-text="providers.length"></dd>
                             </dl>
                         </div>
                     </div>
@@ -1390,13 +1582,13 @@ ADMIN_TEMPLATE = """
                     <div class="flex items-center">
                         <div class="flex-shrink-0">
                             <div class="w-8 h-8 bg-indigo-500 rounded-full flex items-center justify-center">
-                                <span class="text-white text-sm font-bold">API</span>
+                                <span class="text-white text-sm font-bold">🔒</span>
                             </div>
                         </div>
                         <div class="ml-5 w-0 flex-1">
                             <dl>
-                                <dt class="text-sm font-medium text-gray-500 truncate">API接口</dt>
-                                <dd class="text-lg font-medium text-gray-900">已启用</dd>
+                                <dt class="text-sm font-medium text-gray-500 truncate">权限模式</dt>
+                                <dd class="text-lg font-medium text-gray-900">Cookie会话</dd>
                             </dl>
                         </div>
                     </div>
@@ -1434,6 +1626,21 @@ ADMIN_TEMPLATE = """
             <!-- 管理员配置 -->
             <div x-show="activeTab === 'admin-config'" class="p-6">
                 <h2 class="text-lg font-medium text-gray-900 mb-6">管理员配置</h2>
+                <div class="bg-yellow-50 border border-yellow-200 rounded-md p-4 mb-6">
+                    <div class="flex">
+                        <div class="flex-shrink-0">
+                            <svg class="h-5 w-5 text-yellow-400" viewBox="0 0 20 20" fill="currentColor">
+                                <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd" />
+                            </svg>
+                        </div>
+                        <div class="ml-3">
+                            <h3 class="text-sm font-medium text-yellow-800">安全提示</h3>
+                            <div class="mt-2 text-sm text-yellow-700">
+                                <p>修改密码后，所有现有的Cookie会话将被撤销，需要重新登录。</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
                 <form @submit.prevent="saveAdminConfig" class="space-y-6">
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                         <div>
@@ -1465,6 +1672,24 @@ ADMIN_TEMPLATE = """
                     </button>
                 </div>
 
+                <div class="bg-blue-50 border border-blue-200 rounded-md p-4 mb-6">
+                    <div class="flex">
+                        <div class="flex-shrink-0">
+                            <svg class="h-5 w-5 text-blue-400" viewBox="0 0 20 20" fill="currentColor">
+                                <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd" />
+                            </svg>
+                        </div>
+                        <div class="ml-3">
+                            <h3 class="text-sm font-medium text-blue-800">权限说明</h3>
+                            <div class="mt-2 text-sm text-blue-700">
+                                <p>• Cookie会话拥有最高权限，可以创建和管理用户Key</p>
+                                <p>• Admin Key不能创建其他Key或进行敏感操作</p>
+                                <p>• User Key只能访问API接口，不能访问管理面板</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- 用户Key列表 -->
                 <div class="overflow-hidden shadow ring-1 ring-black ring-opacity-5 md:rounded-lg">
                     <table class="min-w-full divide-y divide-gray-300">
@@ -1475,6 +1700,7 @@ ADMIN_TEMPLATE = """
                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">等级</th>
                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态</th>
                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">使用次数</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">最后使用</th>
                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
                             </tr>
                         </thead>
@@ -1494,6 +1720,7 @@ ADMIN_TEMPLATE = """
                                               x-text="userKey.enabled ? '启用' : '禁用'"></span>
                                     </td>
                                     <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="userKey.usage_count || 0"></td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="userKey.last_used ? new Date(userKey.last_used).toLocaleString() : '从未使用'"></td>
                                     <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
                                         <button @click="editUserKey(userKey.id)" class="text-blue-600 hover:text-blue-900 mr-3">编辑</button>
                                         <button @click="deleteUserKey(userKey.id)" class="text-red-600 hover:text-red-900">删除</button>
@@ -1508,6 +1735,23 @@ ADMIN_TEMPLATE = """
             <!-- 权限配置 -->
             <div x-show="activeTab === 'permissions'" class="p-6">
                 <h2 class="text-lg font-medium text-gray-900 mb-6">API端点权限配置</h2>
+                <div class="bg-green-50 border border-green-200 rounded-md p-4 mb-6">
+                    <div class="flex">
+                        <div class="flex-shrink-0">
+                            <svg class="h-5 w-5 text-green-400" viewBox="0 0 20 20" fill="currentColor">
+                                <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd" />
+                            </svg>
+                        </div>
+                        <div class="ml-3">
+                            <h3 class="text-sm font-medium text-green-800">权限等级说明</h3>
+                            <div class="mt-2 text-sm text-green-700">
+                                <p>• <strong>访客</strong>：无需任何密钥即可访问</p>
+                                <p>• <strong>用户</strong>：需要用户级别或管理员级别的API密钥</p>
+                                <p>• <strong>管理员</strong>：需要管理员级别的API密钥或Cookie会话</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
                 <form @submit.prevent="savePermissions" class="space-y-4">
                     <template x-for="(level, endpoint) in permissions" :key="endpoint">
                         <div class="flex items-center justify-between p-4 border border-gray-200 rounded-lg">
@@ -1625,6 +1869,84 @@ ADMIN_TEMPLATE = """
         </div>
     </div>
 
+    <!-- 添加服务商模态框 -->
+    <div x-show="showAddProvider" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50" 
+         x-transition:enter="ease-out duration-300" x-transition:enter-start="opacity-0" x-transition:enter-end="opacity-100"
+         x-transition:leave="ease-in duration-200" x-transition:leave-start="opacity-100" x-transition:leave-end="opacity-0">
+        <div class="relative top-20 mx-auto p-5 border w-11/12 md:w-3/4 lg:w-1/2 shadow-lg rounded-md bg-white">
+            <div class="mt-3">
+                <h3 class="text-lg font-medium text-gray-900 mb-4" x-text="editingProvider ? '编辑服务商' : '添加服务商'"></h3>
+                <form @submit.prevent="saveProvider" class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">服务商名称</label>
+                        <input type="text" x-model="providerForm.name" required 
+                               class="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500">
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">服务商类型</label>
+                        <select x-model="providerForm.provider_type" @change="onProviderTypeChange"
+                                class="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500">
+                            <option value="native">本项目对接</option>
+                            <option value="openai_adapter">OpenAI适配器</option>
+                            <option value="fal_ai">Fal.ai适配器</option>
+                        </select>
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">API地址</label>
+                        <input type="url" x-model="providerForm.base_url" required 
+                               placeholder="https://api.example.com 或 https://api.example.com/v1"
+                               class="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500">
+                        <p class="mt-1 text-sm text-gray-500">
+                            <span x-show="providerForm.provider_type === 'openai_adapter'">OpenAI适配器：如果只填写域名，系统会自动添加/v1</span>
+                            <span x-show="providerForm.provider_type === 'fal_ai'">Fal.ai适配器：通常使用 https://queue.fal.run</span>
+                            <span x-show="providerForm.provider_type === 'native'">本项目对接：填写完整的API地址</span>
+                        </p>
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">API密钥 (逗号分隔)</label>
+                        <textarea x-model="providerForm.api_keys" rows="3" 
+                                  placeholder="sk-key1,sk-key2,sk-key3"
+                                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500"></textarea>
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">
+                            支持的模型 (逗号分隔)
+                            <button type="button" @click="loadDefaultModels" 
+                                    class="ml-2 text-xs bg-gray-100 hover:bg-gray-200 px-2 py-1 rounded">
+                                加载默认模型
+                            </button>
+                        </label>
+                        <textarea x-model="providerForm.models" rows="4" 
+                                  placeholder="模型名称，用逗号分隔"
+                                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500"></textarea>
+                        <p class="mt-1 text-sm text-gray-500">留空将自动使用该类型的默认模型</p>
+                    </div>
+                    
+                    <div class="flex items-center">
+                        <input type="checkbox" x-model="providerForm.enabled" 
+                               class="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded">
+                        <label class="ml-2 block text-sm text-gray-900">启用此服务商</label>
+                    </div>
+                    
+                    <div class="flex justify-end space-x-3 pt-4">
+                        <button type="button" @click="closeProviderModal" 
+                                class="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-200 rounded-md hover:bg-gray-300 transition duration-200">
+                            取消
+                        </button>
+                        <button type="submit" 
+                                class="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700 transition duration-200">
+                            保存
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
     <script>
         function adminApp() {
             return {
@@ -1640,9 +1962,18 @@ ADMIN_TEMPLATE = """
                 showAddUserKey: false,
                 showAddProvider: false,
                 editingUserKey: null,
+                editingProvider: null,
                 userKeyForm: {
                     name: '',
                     level: 'user',
+                    enabled: true
+                },
+                providerForm: {
+                    name: '',
+                    provider_type: 'native',
+                    base_url: '',
+                    api_keys: '',
+                    models: '',
                     enabled: true
                 },
 
@@ -1703,7 +2034,11 @@ ADMIN_TEMPLATE = """
                         
                         const result = await response.json();
                         if (result.success) {
-                            alert('管理员配置保存成功');
+                            alert(result.message || '管理员配置保存成功，请重新登录');
+                            // 如果密码被更改，重定向到登录页面
+                            if (result.message && result.message.includes('重新登录')) {
+                                window.location.href = '/admin/logout';
+                            }
                         } else {
                             alert('保存失败');
                         }
@@ -1829,6 +2164,109 @@ ADMIN_TEMPLATE = """
                     } catch (error) {
                         console.error('加载服务商失败:', error);
                     }
+                },
+
+                async onProviderTypeChange() {
+                    // 当服务商类型改变时，可以自动设置一些默认值
+                    if (this.providerForm.provider_type === 'fal_ai') {
+                        if (!this.providerForm.base_url) {
+                            this.providerForm.base_url = 'https://queue.fal.run';
+                        }
+                    }
+                },
+
+                async loadDefaultModels() {
+                    try {
+                        const response = await fetch(`/admin/api/default-models/${this.providerForm.provider_type}`);
+                        const result = await response.json();
+                        if (result.success) {
+                            this.providerForm.models = result.models.join(',');
+                        }
+                    } catch (error) {
+                        console.error('加载默认模型失败:', error);
+                    }
+                },
+
+                async saveProvider() {
+                    try {
+                        const url = this.editingProvider ? 
+                            `/admin/api/providers/${this.editingProvider}` : 
+                            '/admin/api/providers';
+                        const method = this.editingProvider ? 'PUT' : 'POST';
+                        
+                        const response = await fetch(url, {
+                            method: method,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(this.providerForm)
+                        });
+                        
+                        const result = await response.json();
+                        if (result.success) {
+                            await this.loadProviders();
+                            await this.loadStatus();
+                            this.closeProviderModal();
+                            alert(this.editingProvider ? '服务商更新成功' : '服务商添加成功');
+                        } else {
+                            alert('操作失败: ' + result.message);
+                        }
+                    } catch (error) {
+                        alert('操作失败: ' + error.message);
+                    }
+                },
+
+                async editProvider(providerId) {
+                    try {
+                        const response = await fetch(`/admin/api/providers/${providerId}`);
+                        const provider = await response.json();
+                        
+                        this.providerForm = {
+                            name: provider.name,
+                            provider_type: provider.provider_type,
+                            base_url: provider.base_url,
+                            api_keys: provider.api_keys,
+                            models: provider.models,
+                            enabled: provider.enabled
+                        };
+                        
+                        this.editingProvider = providerId;
+                        this.showAddProvider = true;
+                    } catch (error) {
+                        alert('获取服务商信息失败: ' + error.message);
+                    }
+                },
+
+                async deleteProvider(providerId) {
+                    if (!confirm('确定要删除这个服务商吗？')) return;
+                    
+                    try {
+                        const response = await fetch(`/admin/api/providers/${providerId}`, {
+                            method: 'DELETE'
+                        });
+                        
+                        const result = await response.json();
+                        if (result.success) {
+                            await this.loadProviders();
+                            await this.loadStatus();
+                            alert('服务商删除成功');
+                        } else {
+                            alert('删除失败: ' + result.message);
+                        }
+                    } catch (error) {
+                        alert('删除失败: ' + error.message);
+                    }
+                },
+
+                closeProviderModal() {
+                    this.showAddProvider = false;
+                    this.editingProvider = null;
+                    this.providerForm = {
+                        name: '',
+                        provider_type: 'native',
+                        base_url: '',
+                        api_keys: '',
+                        models: '',
+                        enabled: true
+                    };
                 }
             }
         }
@@ -1846,6 +2284,7 @@ if __name__ == "__main__":
     logger.info(f"服务端口: {system_config.port}")
     logger.info(f"管理员面板: http://localhost:{system_config.port}/admin")
     logger.info(f"最大图片数量: {system_config.max_images_per_request}")
+    logger.info("Cookie会话管理已启用，有效期3天")
     
     # 检查服务商配置
     providers = config_manager.get_all_providers()
@@ -1877,3 +2316,4 @@ if __name__ == "__main__":
     
     # 启动服务
     app.run(host="0.0.0.0", port=system_config.port)
+
