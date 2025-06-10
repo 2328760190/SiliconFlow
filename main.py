@@ -6,12 +6,19 @@ import random
 import string
 import logging
 import secrets
-from typing import Dict, List, Any, Optional, Union
 import base64
 import io
+import hashlib
+from typing import Dict, List, Any, Optional, Union, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import wraps
 
 import requests
-from flask import Flask, request, Response, jsonify, stream_with_context
+from flask import Flask, request, Response, jsonify, stream_with_context, render_template_string, session, redirect, url_for
+
+# 导入配置管理器和适配器
+from config_manager import config_manager, ServiceProvider, ProviderType, UserKey, AdminConfig
+from fal_adapter import FalAIAdapter
 
 # 配置日志
 logging.basicConfig(
@@ -21,119 +28,96 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
 
-# 支持的画图模型列表
-SUPPORTED_MODELS = [
-    # Flux模型
-    "black-forest-labs/FLUX.1-dev",
-    "black-forest-labs/FLUX.1",
-    
-    # Kolors模型
-    "Kwai-Kolors/Kolors",
-    
-    # Stable Diffusion模型
-    "stabilityai/stable-diffusion-xl-base-1.0",
-    "stabilityai/stable-diffusion-2-1-base",
-    "runwayml/stable-diffusion-v1-5",
-    
-    # Midjourney风格模型
-    "prompthero/openjourney",
-    
-    # 动漫风格模型
-    "Linaqruf/anything-v3.0",
-    "hakurei/waifu-diffusion",
-    
-    # 写实风格模型
-    "dreamlike-art/dreamlike-photoreal-2.0",
-    
-    # 其他模型
-    "CompVis/stable-diffusion-v1-4",
-    "stabilityai/stable-diffusion-2-base"
-]
+# 权限验证装饰器
+def verify_permission(required_level: str = "guest"):
+    """权限验证装饰器"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            # 获取端点权限配置
+            endpoint_permissions = config_manager.get_endpoint_permissions()
+            endpoint = request.endpoint or request.path
+            
+            # 检查端点权限要求
+            actual_required_level = endpoint_permissions.get(endpoint, required_level)
+            
+            # 访客级别不需要验证
+            if actual_required_level == "guest":
+                return f(*args, **kwargs)
+            
+            # 获取授权信息
+            auth_header = request.headers.get("Authorization", "")
+            api_key = None
+            
+            if auth_header.startswith("Bearer "):
+                api_key = auth_header[7:]
+            elif auth_header.startswith("Key "):
+                api_key = auth_header[4:]
+            
+            # URL参数中的key
+            if not api_key:
+                api_key = request.args.get("key") or request.form.get("key")
+            
+            if not api_key:
+                return jsonify({"error": "Unauthorized: API key required"}), 401
+            
+            # 验证管理员Key
+            system_config = config_manager.get_system_config()
+            if api_key == system_config.api_key and system_config.api_key:
+                # 管理员权限，允许所有操作
+                return f(*args, **kwargs)
+            
+            # 验证用户Key
+            user_key = config_manager.get_user_key_by_key(api_key)
+            if not user_key or not user_key.enabled:
+                return jsonify({"error": "Unauthorized: Invalid API key"}), 401
+            
+            # 检查权限等级
+            if actual_required_level == "admin" and user_key.level != "admin":
+                return jsonify({"error": "Forbidden: Admin access required"}), 403
+            
+            if actual_required_level == "user" and user_key.level not in ["user", "admin"]:
+                return jsonify({"error": "Forbidden: User access required"}), 403
+            
+            # 更新使用记录
+            config_manager.update_user_key_usage(api_key)
+            
+            return f(*args, **kwargs)
+        
+        decorated_function.__name__ = f.__name__
+        return decorated_function
+    return decorator
 
-# 类型定义
-class Message:
-    def __init__(self, role: str, content: str):
-        self.role = role
-        self.content = content
-    
-    def to_dict(self):
-        return {
-            "role": self.role,
-            "content": self.content
-        }
+def require_admin_auth(f):
+    """管理员认证装饰器"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'admin_authenticated' not in session:
+            return redirect(url_for('admin_login'))
+        return f(*args, **kwargs)
+    decorated_function.__name__ = f.__name__
+    return decorated_function
 
-class Choice:
-    def __init__(self, index: int, message: Message, finish_reason: str):
-        self.index = index
-        self.message = message
-        self.logprobs = None
-        self.finish_reason = finish_reason
-    
-    def to_dict(self):
-        return {
-            "index": self.index,
-            "message": self.message.to_dict(),
-            "logprobs": self.logprobs,
-            "finish_reason": self.finish_reason
-        }
-
-class Usage:
-    def __init__(self, prompt_tokens: int, completion_tokens: int, total_tokens: int):
-        self.prompt_tokens = prompt_tokens
-        self.completion_tokens = completion_tokens
-        self.total_tokens = total_tokens
-    
-    def to_dict(self):
-        return {
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.total_tokens
-        }
-
-class ResponsePayload:
-    def __init__(self, id: int, object: str, created: int, model: str, choices: List[Choice], usage: Usage):
-        self.id = id
-        self.object = object
-        self.created = created
-        self.model = model
-        self.choices = choices
-        self.usage = usage
-    
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "object": self.object,
-            "created": self.created,
-            "model": self.model,
-            "choices": [choice.to_dict() for choice in self.choices],
-            "usage": self.usage.to_dict()
-        }
-
-# 辅助函数
-def get_env(key: str, default: str = "") -> str:
-    """获取环境变量，如果不存在则返回默认值"""
-    return os.environ.get(key, default)
+# 辅助函数（保持原有功能）
+def get_env_with_fallback(key: str, default: str = "") -> str:
+    """获取配置值，优先级：Redis/SQLite > 环境变量 > 默认值"""
+    return config_manager.get_env_with_fallback(key, default)
 
 def get_env_bool(key: str, default: bool = False) -> bool:
-    """获取布尔类型环境变量，如果不存在则返回默认值"""
-    value = os.environ.get(key, str(default)).lower()
+    """获取布尔类型配置值"""
+    value = get_env_with_fallback(key, str(default)).lower()
     return value in ("true", "1", "yes", "y", "t")
 
 def get_env_int(key: str, default: int) -> int:
-    """获取整数类型环境变量，如果不存在则返回默认值"""
+    """获取整数类型配置值"""
     try:
-        return int(os.environ.get(key, str(default)))
+        return int(get_env_with_fallback(key, str(default)))
     except ValueError:
         return default
 
-def get_random_api_key() -> str:
-    """从API_KEYS环境变量中随机选择一个API密钥"""
-    keys = get_env("API_KEYS", "").split(",")
-    if not keys or keys[0] == "":
-        raise ValueError("API_KEYS environment variable not set")
-    return random.choice(keys)
-
+# 保持原有的辅助函数
 def contains_chinese(text: str) -> bool:
     """检查文本是否包含中文字符"""
     pattern = re.compile(r'[\u4e00-\u9fff]')
@@ -190,11 +174,12 @@ def match_resolution(text: str) -> str:
         return "1024x576"
     
     logger.info("未检测到特定分辨率，使用默认值: 1024x1024")
-    return "1024x1024"  # 默认分辨率
+    return "1024x1024"
 
 def moderate_check(text: str) -> bool:
     """检查文本是否包含被禁止的关键词"""
-    banned_words = get_env("BANNED_KEYWORDS", "").split(",")
+    system_config = config_manager.get_system_config()
+    banned_words = system_config.banned_keywords.split(",") if system_config.banned_keywords else []
     text_lower = text.lower()
     
     for word in banned_words:
@@ -211,35 +196,33 @@ def generate_random_slug(length: int = 3) -> str:
 
 def generate_short_url(long_url: str) -> str:
     """生成短链接"""
-    # 检查是否启用短链接服务
-    if not get_env_bool("USE_SHORTLINK", False):
+    shortlink_config = config_manager.get_shortlink_config()
+    
+    if not shortlink_config.enabled:
         return long_url
     
     if len(long_url) < 30:
         return long_url
     
-    base_url = get_env("SHORTLINK_BASE_URL")
-    api_key = get_env("SHORTLINK_API_KEY")
-    
-    if not base_url or not api_key:
+    if not shortlink_config.base_url or not shortlink_config.api_key:
         return long_url
     
     slug = generate_random_slug()
-    api_url = f"{base_url}/api/link/create"
+    api_url = f"{shortlink_config.base_url}/api/link/create"
     
     try:
         response = requests.post(
             api_url,
             json={"url": long_url, "slug": slug},
             headers={
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {shortlink_config.api_key}",
                 "Content-Type": "application/json"
             },
             timeout=5
         )
         
         if response.status_code in (200, 201):
-            return f"{base_url}{slug}"
+            return f"{shortlink_config.base_url}{slug}"
         
         logger.error(f"短链接API错误响应: {response.text}")
     except Exception as e:
@@ -247,37 +230,58 @@ def generate_short_url(long_url: str) -> str:
     
     return long_url
 
-def upload_to_lsky_pro(image_url: str) -> Optional[str]:
+def upload_to_lsky_pro(image_data: Union[str, bytes]) -> Optional[str]:
     """上传图片到蓝空图床"""
-    # 检查是否启用蓝空图床
-    if not get_env_bool("USE_LSKY_PRO", False):
+    hosting_config = config_manager.get_image_hosting_config()
+    
+    if not hosting_config.enabled:
         return None
     
-    lsky_url = get_env("LSKY_PRO_URL")
-    lsky_token = get_env("LSKY_PRO_TOKEN")
-    
-    if not lsky_url or not lsky_token:
-        logger.error("蓝空图床配置不完整，请检查LSKY_PRO_URL和LSKY_PRO_TOKEN环境变量")
+    if not hosting_config.lsky_url or not hosting_config.token:
+        logger.error("蓝空图床配置不完整")
         return None
     
     try:
-        # 下载原始图片
-        logger.info(f"从 {image_url} 下载图片")
-        image_response = requests.get(image_url, timeout=10)
-        if image_response.status_code != 200:
-            logger.error(f"下载图片失败: {image_response.status_code}")
+        # 准备图片数据
+        image_content = None
+        
+        # 如果是URL，下载图片
+        if isinstance(image_data, str) and (image_data.startswith('http://') or image_data.startswith('https://')):
+            logger.info(f"从URL下载图片: {image_data}")
+            image_response = requests.get(image_data, timeout=10)
+            if image_response.status_code != 200:
+                logger.error(f"下载图片失败: {image_response.status_code}")
+                return None
+            image_content = image_response.content
+        
+        # 如果是base64编码的图片
+        elif isinstance(image_data, str) and image_data.startswith('data:image'):
+            logger.info("处理base64编码的图片")
+            image_data = image_data.split(',', 1)[1] if ',' in image_data else image_data
+            try:
+                image_content = base64.b64decode(image_data)
+            except Exception as e:
+                logger.error(f"解码base64图片失败: {e}")
+                return None
+        
+        # 如果是二进制数据
+        elif isinstance(image_data, bytes):
+            logger.info("处理二进制图片数据")
+            image_content = image_data
+        
+        else:
+            logger.error(f"不支持的图片数据格式: {type(image_data)}")
             return None
         
         # 准备上传到蓝空图床
-        upload_url = f"{lsky_url.rstrip('/')}/api/v1/upload"
+        upload_url = f"{hosting_config.lsky_url.rstrip('/')}/api/v1/upload"
         
-        # 使用multipart/form-data上传
         files = {
-            'file': ('image.png', image_response.content, 'image/png')
+            'file': ('image.png', image_content, 'image/png')
         }
         
         headers = {
-            'Authorization': f'Bearer {lsky_token}'
+            'Authorization': f'Bearer {hosting_config.token}'
         }
         
         logger.info(f"上传图片到蓝空图床: {upload_url}")
@@ -312,13 +316,15 @@ def upload_to_lsky_pro(image_url: str) -> Optional[str]:
 
 def generate_image_prompt(api_key: str, text: str) -> str:
     """使用LLM生成图像提示"""
-    image_prompt_model = get_env("IMAGE_PROMPT_MODEL", "Qwen/Qwen2.5-7B-Instruct")
-    llm_api_url = get_env("LLM_API_URL", "http://localhost:3000/v1/chat/completions")
+    ai_config = config_manager.get_ai_prompt_config()
+    
+    if not ai_config.enabled:
+        return text
     
     messages = [
         {
             "role": "system",
-            "content": "你是一个技术精湛、善于观察、富有创造力和想象力、擅长使用精准语言描述画面的艺术家。请根据用户的作画请求（可能是一组包含绘画要求的上下文，跳过其中的非绘画内容），扩充为一段具体的画面描述，100 words以内。可以包括画面内容、风格、技法等，使用英文回复."
+            "content": ai_config.system_prompt
         },
         {
             "role": "user",
@@ -328,13 +334,13 @@ def generate_image_prompt(api_key: str, text: str) -> str:
     
     try:
         response = requests.post(
-            llm_api_url,
+            ai_config.api_url,
             json={
-                "model": image_prompt_model,
+                "model": ai_config.model,
                 "messages": messages
             },
             headers={
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {ai_config.api_key}",
                 "Content-Type": "application/json"
             }
         )
@@ -347,240 +353,636 @@ def generate_image_prompt(api_key: str, text: str) -> str:
     
     return text
 
-def generate_image_stream(unique_id: int, current_timestamp: int, model: str, prompt: str, 
-                         new_url: str, new_request_body: Dict, headers: Dict):
-    """生成图像流式响应"""
-    # 提示信息
-    prompt_payload = {
-        "id": unique_id,
-        "object": "chat.completion.chunk",
-        "created": current_timestamp,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "delta": {
-                    "content": f"```\n{{\n  \"prompt\":\"{prompt}\"\n}}\n```\n"
-                }
-            }
-        ],
-        "finish_reason": None
-    }
-    yield f"data: {json.dumps(prompt_payload)}\n\n"
-    
-    # 等待一小段时间，确保客户端收到提示信息
-    time.sleep(0.5)
-    
-    # 任务进行中
-    task_payload = {
-        "id": unique_id,
-        "object": "chat.completion.chunk",
-        "created": current_timestamp,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "delta": {
-                    "content": "> 生成中"
-                }
-            }
-        ],
-        "finish_reason": None
-    }
-    yield f"data: {json.dumps(task_payload)}\n\n"
-    
-    # 等待一小段时间，确保客户端收到进行中信息
-    time.sleep(0.5)
-
-    # 请求已提交
-    submitted_payload = {
-        "id": unique_id,
-        "object": "chat.completion.chunk",
-        "created": current_timestamp,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "delta": {
-                    "content": "\n生成中✅"
-                }
-            }
-        ],
-        "finish_reason": None
-    }
-    yield f"data: {json.dumps(submitted_payload)}\n\n"
-
-    # 等待一小段时间，确保客户端收到提交成功信息
-    time.sleep(0.5)
-    
-    # 调用图像生成API
+def extract_base64_image(response_data: Dict) -> Optional[str]:
+    """从API响应中提取base64编码的图片"""
     try:
-        logger.info(f"调用图像生成API: {new_url}")
-        logger.info(f"请求头: {headers}")
-        logger.info(f"请求体: {new_request_body}")
-        
-        response = requests.post(
-            new_url,
-            json=new_request_body,
-            headers=headers
-        )
-        
-        logger.info(f"API响应状态码: {response.status_code}")
-        logger.info(f"API响应内容: {response.text[:200]}...")
-        
-        # 确保响应是JSON格式
-        try:
-            response_body = response.json()
-        except json.JSONDecodeError as e:
-            logger.error(f"解析API响应失败: {e}, 响应内容: {response.text}")
-            response_body = {"message": f"解析API响应失败: {response.text[:100]}..."}
-        
-        # 检查响应中是否包含图像URL
-        if isinstance(response_body, dict) and "images" in response_body and response_body["images"]:
-            # 确保images是列表且包含字典元素
-            if isinstance(response_body["images"], list) and len(response_body["images"]) > 0:
-                image_item = response_body["images"][0]
-                if isinstance(image_item, dict) and "url" in image_item:
-                    image_url = image_item["url"]
-                    logger.info(f"接收到的 imageURL: {image_url}")
-                    
-                    # 生成短链接
-                    short_url = generate_short_url(image_url)
-                    
-                    # 上传到蓝空图床
-                    lsky_url = upload_to_lsky_pro(image_url)
-                    
-                    # 构建响应文本
-                    # 确保prompt不包含换行符
-                    safe_prompt = prompt.replace("\n", " ")
-                    
-                    if lsky_url:
-                        task_text = f"✅\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n蓝空图床链接(永久有效)：{lsky_url}\n\n![image1|{safe_prompt}]({lsky_url})"
-                    else:
-                        task_text = f"✅\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n![image1|{safe_prompt}]({short_url})"
+        # 检查常见的base64图片字段
+        if "images" in response_data and isinstance(response_data["images"], list) and len(response_data["images"]) > 0:
+            if isinstance(response_data["images"][0], str):
+                base64_data = response_data["images"][0]
+                if base64_data.startswith('data:image'):
+                    return base64_data
                 else:
-                    logger.error(f"图像项格式错误: {image_item}")
-                    task_text = f"❌\n\n\`\`\`\n{{\n  \"message\":\"图像格式错误\"\n}}\n\`\`\`"
-            else:
-                logger.error(f"图像列表格式错误: {response_body['images']}")
-                task_text = f"❌\n\n\`\`\`\n{{\n  \"message\":\"图像列表格式错误\"\n}}\n\`\`\`"
-        else:
-            error_msg = "未知错误"
-            if isinstance(response_body, dict) and "message" in response_body:
-                error_msg = str(response_body["message"])
-            task_text = f"❌\n\n\`\`\`\n{{\n  \"message\":\"{error_msg}\"\n}}\n\`\`\`"
-            logger.error(f"画图失败：{response_body}")
+                    return f"data:image/png;base64,{base64_data}"
+            
+            elif isinstance(response_data["images"][0], dict):
+                if "b64_json" in response_data["images"][0]:
+                    return f"data:image/png;base64,{response_data['images'][0]['b64_json']}"
+                elif "data" in response_data["images"][0]:
+                    data = response_data["images"][0]["data"]
+                    if isinstance(data, str):
+                        if data.startswith('data:image'):
+                            return data
+                        else:
+                            return f"data:image/png;base64,{data}"
         
-        task_payload["choices"][0]["delta"]["content"] = task_text
-        yield f"data: {json.dumps(task_payload)}\n\n"
+        if "data" in response_data and isinstance(response_data["data"], list) and len(response_data["data"]) > 0:
+            if "b64_json" in response_data["data"][0]:
+                return f"data:image/png;base64,{response_data['data'][0]['b64_json']}"
+            elif "base64" in response_data["data"][0]:
+                return f"data:image/png;base64,{response_data['data'][0]['base64']}"
+        
+        if "b64_json" in response_data:
+            return f"data:image/png;base64,{response_data['b64_json']}"
+        elif "base64" in response_data:
+            return f"data:image/png;base64,{response_data['base64']}"
+        
+        logger.error(f"未找到base64图片数据: {list(response_data.keys())}")
+        return None
+    
     except Exception as e:
-        logger.error(f"生成图像失败: {str(e)}")
-        task_text = f"❌\n\n\`\`\`\n{{\n  \"message\":\"服务器错误: {str(e)}\"\n}}\n\`\`\`"
-        task_payload["choices"][0]["delta"]["content"] = task_text
-        yield f"data: {json.dumps(task_payload)}\n\n"
-    
-    yield "data: [DONE]\n\n"
+        logger.error(f"提取base64图片失败: {e}")
+        return None
 
-def send_response(body: Dict, response_text: str) -> Dict:
-    """构建API响应"""
-    unique_id = int(time.time() * 1000)
-    current_timestamp = int(time.time())
+def extract_image_url(response_data: Dict) -> Optional[str]:
+    """从API响应中提取图片URL"""
+    try:
+        if "images" in response_data and isinstance(response_data["images"], list) and len(response_data["images"]) > 0:
+            if isinstance(response_data["images"][0], str) and (response_data["images"][0].startswith('http://') or response_data["images"][0].startswith('https://')):
+                return response_data["images"][0]
+            
+            elif isinstance(response_data["images"][0], dict):
+                if "url" in response_data["images"][0]:
+                    return response_data["images"][0]["url"]
+                elif "image_url" in response_data["images"][0]:
+                    return response_data["images"][0]["image_url"]
+        
+        if "data" in response_data and isinstance(response_data["data"], list) and len(response_data["data"]) > 0:
+            if "url" in response_data["data"][0]:
+                return response_data["data"][0]["url"]
+            elif "image_url" in response_data["data"][0]:
+                return response_data["data"][0]["image_url"]
+        
+        if "url" in response_data:
+            return response_data["url"]
+        elif "image_url" in response_data:
+            return response_data["image_url"]
+        
+        logger.error(f"未找到图片URL: {list(response_data.keys())}")
+        return None
     
-    return {
-        "id": unique_id,
-        "object": "chat.completion",
-        "created": current_timestamp,
-        "model": body["model"],
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": response_text
-                },
-                "logprobs": None,
-                "finish_reason": "stop"
-            }
-        ],
-        "usage": {
-            "prompt_tokens": len(body["messages"][-1]["content"]),
-            "completion_tokens": len(response_text),
-            "total_tokens": len(body["messages"][-1]["content"]) + len(response_text)
-        }
-    }
+    except Exception as e:
+        logger.error(f"提取图片URL失败: {e}")
+        return None
 
-def verify_api_key(request_auth: str) -> bool:
-    """验证API密钥"""
-    service_api_key = get_env("API_KEY", "")
-    
-    # 如果未设置API_KEY环境变量，则不进行验证
-    if not service_api_key:
-        return True
-    
-    # 检查请求头中的Authorization
-    if not request_auth:
-        return False
-    
-    # 提取Bearer token
-    parts = request_auth.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        return False
-    
-    # 验证token
-    return parts[1] == service_api_key
-
-def extract_image_count(text: str) -> tuple[str, int]:
-    """从文本中提取图片数量，并返回处理后的文本和图片数量"""
-    # 默认图片数量
-    default_count = get_env_int("MAX_IMAGES_PER_REQUEST", 4)
-    
-    # 查找 pic:number 模式
-    pattern = re.compile(r'\bpic:(\d+)\b')
+def extract_seed_from_text(text: str) -> tuple[str, Optional[int]]:
+    """从文本中提取种子值"""
+    pattern = re.compile(r'\bseed:(\d+)\b')
     match = pattern.search(text)
     
     if not match:
-        return text, 1  # 默认生成1张图片
+        return text, None
     
-    # 提取数量
-    count = int(match.group(1))
-    # 限制最大数量
-    count = min(count, default_count)
-    
-    # 从文本中移除 pic:number
+    seed = int(match.group(1))
     cleaned_text = pattern.sub('', text).strip()
     
-    logger.info(f"检测到图片数量设置: {count}张")
-    return cleaned_text, count
+    logger.info(f"检测到种子设置: {seed}")
+    return cleaned_text, seed
 
-# API路由
+def extract_seed_from_response(response_data: Dict) -> Optional[int]:
+    """从API响应中提取种子值"""
+    try:
+        if "meta" in response_data:
+            meta = response_data["meta"]
+            if isinstance(meta, dict) and "seed" in meta:
+                return int(meta["seed"])
+        
+        if "images" in response_data and isinstance(response_data["images"], list) and len(response_data["images"]) > 0:
+            if isinstance(response_data["images"][0], dict):
+                if "seed" in response_data["images"][0]:
+                    return int(response_data["images"][0]["seed"])
+                elif "meta" in response_data["images"][0] and isinstance(response_data["images"][0]["meta"], dict):
+                    if "seed" in response_data["images"][0]["meta"]:
+                        return int(response_data["images"][0]["meta"]["seed"])
+        
+        if "seed" in response_data:
+            return int(response_data["seed"])
+        
+        logger.warning(f"未找到种子值: {list(response_data.keys())}")
+        return None
+    
+    except Exception as e:
+        logger.error(f"提取种子值失败: {e}")
+        return None
+
+def call_provider_api(provider: ServiceProvider, model: str, prompt: str, options: Dict) -> List[str]:
+    """调用服务商API生成图像"""
+    if provider.provider_type == ProviderType.FAL_AI:
+        # 使用Fal.ai适配器
+        fal_adapter = FalAIAdapter(provider.api_keys)
+        return fal_adapter.call_fal_api(prompt, model, options)
+    
+    elif provider.provider_type == ProviderType.OPENAI_ADAPTER:
+        # OpenAI适配器类型
+        url = f"{provider.base_url.rstrip('/')}/images/generations"
+        headers = {
+            "Authorization": f"Bearer {provider.api_keys[0]}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": model,
+            "prompt": prompt,
+            "size": options.get("size", "1024x1024"),
+            "n": options.get("n", 1),
+            "response_format": options.get("response_format", "url")
+        }
+        
+        if "seed" in options:
+            data["seed"] = options["seed"]
+        
+        response = requests.post(url, headers=headers, json=data, timeout=60)
+        
+        if response.status_code == 200:
+            result = response.json()
+            if "data" in result:
+                return [item["url"] for item in result["data"] if "url" in item]
+        
+        raise ValueError(f"OpenAI适配器调用失败: {response.text}")
+    
+    else:
+        # 本项目对接类型 - 使用原有逻辑
+        return call_native_api(provider, model, prompt, options)
+
+def call_native_api(provider: ServiceProvider, model: str, prompt: str, options: Dict) -> List[str]:
+    """调用本项目对接类型的API"""
+    # 根据模型选择API端点
+    if model == "Kwai-Kolors/Kolors":
+        url = f"{provider.base_url.rstrip('/')}/v1/images/generations"
+        data = {
+            "model": model,
+            "prompt": prompt,
+            "image_size": options.get("size", "1024x1024"),
+            "batch_size": 1,
+            "num_inference_steps": 20,
+            "guidance_scale": 7.5
+        }
+    elif "flux" in model.lower():
+        url = f"{provider.base_url.rstrip('/')}/v1/image/generations"
+        data = {
+            "model": model,
+            "prompt": prompt,
+            "image_size": options.get("size", "1024x1024"),
+            "num_inference_steps": 20,
+            "prompt_enhancement": True
+        }
+    else:
+        url = f"{provider.base_url.rstrip('/')}/v1/{model}/text-to-image"
+        data = {
+            "prompt": prompt,
+            "image_size": options.get("size", "1024x1024"),
+            "num_inference_steps": 20
+        }
+    
+    if "seed" in options:
+        data["seed"] = options["seed"]
+    
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "Authorization": f"Bearer {provider.api_keys[0]}"
+    }
+    
+    response = requests.post(url, json=data, headers=headers, timeout=60)
+    
+    if response.status_code == 200:
+        result = response.json()
+        
+        # 提取图片URL
+        image_url = extract_image_url(result)
+        if image_url:
+            return [image_url]
+        
+        # 提取base64图片
+        base64_data = extract_base64_image(result)
+        if base64_data:
+            return [base64_data]
+        
+        raise ValueError("未找到图片数据")
+    
+    raise ValueError(f"API调用失败: {response.text}")
+
+def process_image_response(response_data: Union[List[str], str], prompt: str) -> Tuple[bool, str, Optional[str]]:
+    """处理图像API的响应"""
+    try:
+        # 如果是字符串列表，取第一个
+        if isinstance(response_data, list) and len(response_data) > 0:
+            image_data = response_data[0]
+        elif isinstance(response_data, str):
+            image_data = response_data
+        else:
+            logger.error(f"无效的响应数据类型: {type(response_data)}")
+            return False, "无效的响应数据", None
+        
+        safe_prompt = prompt.replace("\n", " ")
+        
+        # 处理URL类型的图片
+        if image_data.startswith('http://') or image_data.startswith('https://'):
+            logger.info(f"找到图片URL: {image_data}")
+            
+            short_url = generate_short_url(image_data)
+            lsky_url = upload_to_lsky_pro(image_data)
+            
+            if lsky_url:
+                return True, lsky_url, lsky_url
+            else:
+                return True, short_url, short_url
+        
+        # 处理base64类型的图片
+        elif image_data.startswith('data:image'):
+            logger.info("找到base64图片数据")
+            
+            hosting_config = config_manager.get_image_hosting_config()
+            if hosting_config.enabled:
+                lsky_url = upload_to_lsky_pro(image_data)
+                
+                if lsky_url:
+                    return True, lsky_url, lsky_url
+            
+            return True, image_data, image_data
+        
+        else:
+            logger.error(f"未识别的图片数据格式: {image_data[:100]}...")
+            return False, "未识别的图片格式", None
+    
+    except Exception as e:
+        logger.error(f"处理图片响应失败: {e}")
+        return False, f"处理响应时出错: {str(e)}", None
+
+def get_all_supported_models() -> List[str]:
+    """获取所有支持的模型列表"""
+    providers = config_manager.get_all_providers()
+    all_models = set()
+    
+    for provider in providers:
+        if provider.enabled:
+            all_models.update(provider.models)
+    
+    # 如果没有配置的服务商，返回默认模型
+    if not all_models:
+        for provider_type in ProviderType:
+            all_models.update(config_manager.get_default_models_for_type(provider_type))
+    
+    return list(all_models)
+
+def find_provider_for_model(model: str) -> Optional[ServiceProvider]:
+    """根据模型名称查找支持该模型的服务商"""
+    providers = config_manager.get_all_providers()
+    
+    # 只考虑启用的服务商
+    enabled_providers = [p for p in providers if p.enabled]
+    
+    # 首先检查是否有服务商明确支持该模型
+    for provider in enabled_providers:
+        if model in provider.models:
+            return provider
+    
+    # 如果没有找到，返回第一个启用的服务商（如果有）
+    return enabled_providers[0] if enabled_providers else None
+
+# 管理员登录页面
+@app.route('/admin/login', methods=['GET', 'POST'])
+def admin_login():
+    if request.method == 'POST':
+        data = request.get_json()
+        username = data.get('username')
+        password = data.get('password')
+        
+        admin_config = config_manager.get_admin_config()
+        
+        if username == admin_config.username and password == admin_config.password:
+            session['admin_authenticated'] = True
+            return jsonify({'success': True})
+        else:
+            return jsonify({'success': False, 'message': '用户名或密码错误'})
+    
+    return render_template_string(LOGIN_TEMPLATE)
+
+@app.route('/admin/logout')
+def admin_logout():
+    session.pop('admin_authenticated', None)
+    return redirect(url_for('admin_login'))
+
+@app.route('/admin')
+@require_admin_auth
+def admin_dashboard():
+    return render_template_string(ADMIN_TEMPLATE)
+
+# 管理员API - 获取状态
+@app.route('/admin/api/status')
+@require_admin_auth
+def get_admin_status():
+    return jsonify(config_manager.get_config_status())
+
+# 管理员API - 管理员配置
+@app.route('/admin/api/admin-config', methods=['GET'])
+@require_admin_auth
+def get_admin_config():
+    config = config_manager.get_admin_config()
+    return jsonify({
+        'username': config.username,
+        'password': config.password
+    })
+
+@app.route('/admin/api/admin-config', methods=['POST'])
+@require_admin_auth
+def set_admin_config():
+    data = request.get_json()
+    config = AdminConfig(
+        username=data.get('username', 'admin'),
+        password=data.get('password', 'admin123')
+    )
+    config_manager.set_admin_config(config)
+    return jsonify({'success': True})
+
+# 管理员API - 用户Key管理
+@app.route('/admin/api/user-keys', methods=['GET'])
+@require_admin_auth
+def get_user_keys():
+    user_keys = config_manager.get_all_user_keys()
+    return jsonify([{
+        'id': uk.id,
+        'name': uk.name,
+        'key': uk.key,
+        'level': uk.level,
+        'enabled': uk.enabled,
+        'created_at': uk.created_at,
+        'last_used': uk.last_used,
+        'usage_count': uk.usage_count
+    } for uk in user_keys])
+
+@app.route('/admin/api/user-keys', methods=['POST'])
+@require_admin_auth
+def add_user_key():
+    data = request.get_json()
+    
+    # 生成唯一ID和Key
+    key_id = hashlib.md5(f"{data['name']}{datetime.now().isoformat()}".encode()).hexdigest()[:8]
+    api_key = f"sk-{secrets.token_urlsafe(32)}"
+    
+    user_key = UserKey(
+        id=key_id,
+        name=data['name'],
+        key=api_key,
+        level=data.get('level', 'user'),
+        enabled=data.get('enabled', True)
+    )
+    
+    if config_manager.add_user_key(user_key):
+        return jsonify({'success': True, 'key': api_key})
+    else:
+        return jsonify({'success': False, 'message': '添加用户Key失败'})
+
+@app.route('/admin/api/user-keys/<key_id>', methods=['PUT'])
+@require_admin_auth
+def update_user_key(key_id):
+    data = request.get_json()
+    user_key = config_manager.get_user_key(key_id)
+    
+    if not user_key:
+        return jsonify({'success': False, 'message': '用户Key不存在'})
+    
+    user_key.name = data.get('name', user_key.name)
+    user_key.level = data.get('level', user_key.level)
+    user_key.enabled = data.get('enabled', user_key.enabled)
+    
+    if config_manager.add_user_key(user_key):
+        return jsonify({'success': True})
+    else:
+        return jsonify({'success': False, 'message': '更新用户Key失败'})
+
+@app.route('/admin/api/user-keys/<key_id>', methods=['DELETE'])
+@require_admin_auth
+def delete_user_key(key_id):
+    if config_manager.delete_user_key(key_id):
+        return jsonify({'success': True})
+    else:
+        return jsonify({'success': False, 'message': '删除用户Key失败'})
+
+# 管理员API - 权限配置
+@app.route('/admin/api/permissions', methods=['GET'])
+@require_admin_auth
+def get_permissions():
+    return jsonify(config_manager.get_endpoint_permissions())
+
+@app.route('/admin/api/permissions', methods=['POST'])
+@require_admin_auth
+def set_permissions():
+    data = request.get_json()
+    config_manager.set_endpoint_permissions(data)
+    return jsonify({'success': True})
+
+# 服务商管理API（与之前类似，但添加权限验证）
+@app.route('/admin/api/providers', methods=['GET'])
+@require_admin_auth
+def get_providers():
+    providers = config_manager.get_all_providers()
+    return jsonify([{
+        'id': p.id,
+        'name': p.name,
+        'provider_type': p.provider_type.value,
+        'base_url': p.base_url,
+        'api_keys_count': len(p.api_keys),
+        'models_count': len(p.models),
+        'enabled': p.enabled,
+        'created_at': p.created_at
+    } for p in providers])
+
+@app.route('/admin/api/providers', methods=['POST'])
+@require_admin_auth
+def add_provider():
+    data = request.get_json()
+    
+    # 生成唯一ID
+    provider_id = hashlib.md5(f"{data['name']}{datetime.now().isoformat()}".encode()).hexdigest()[:8]
+    
+    # 处理base_url
+    base_url = data['base_url'].rstrip('/')
+    if data['provider_type'] == 'openai_adapter' and not base_url.endswith('/v1'):
+        if '/' not in base_url.split('://', 1)[1]:  # 只有域名
+            base_url += '/v1'
+    
+    # 获取默认模型
+    provider_type = ProviderType(data['provider_type'])
+    default_models = config_manager.get_default_models_for_type(provider_type)
+    
+    # 如果用户没有指定模型，使用默认模型
+    user_models = data['models'].split(',') if data['models'] else []
+    final_models = user_models if user_models else default_models
+    
+    provider = ServiceProvider(
+        id=provider_id,
+        name=data['name'],
+        provider_type=provider_type,
+        base_url=base_url,
+        api_keys=data['api_keys'].split(',') if data['api_keys'] else [],
+        models=final_models,
+        enabled=data.get('enabled', True)
+    )
+    
+    if config_manager.add_provider(provider):
+        return jsonify({'success': True, 'provider_id': provider_id})
+    else:
+        return jsonify({'success': False, 'message': '添加服务商失败'})
+
+# 主要API路由
 @app.route("/v1/models", methods=["GET"])
+@verify_permission("guest")  # 默认访客级别
 def list_models():
     """列出支持的模型"""
-    # 验证API密钥
-    if not verify_api_key(request.headers.get("Authorization", "")):
-        return jsonify({"error": "Unauthorized: Invalid API key"}), 401
-    
+    all_models = get_all_supported_models()
     models_data = {
         "object": "list",
-        "data": [{"id": model, "object": "model"} for model in SUPPORTED_MODELS]
+        "data": [{"id": model, "object": "model"} for model in all_models]
     }
     return jsonify(models_data)
 
-@app.route("/v1/chat/completions", methods=["POST"])
-def handle_request():
-    """处理图像生成请求"""
+@app.route("/v1/images/generations", methods=["POST"])
+@verify_permission("user")  # 默认用户级别
+def openai_images():
+    """OpenAI兼容的图像生成接口"""
+    data = request.json
+    if not data:
+        return jsonify({
+            "error": {
+                "message": "Missing or invalid request body",
+                "type": "invalid_request_error"
+            }
+        }), 400
+    
+    prompt = data.get('prompt', '')
+    if not prompt:
+        return jsonify({
+            "error": {
+                "message": "prompt is required",
+                "type": "invalid_request_error"
+            }
+        }), 400
+    
+    model = data.get('model', 'flux-dev')
+    size = data.get('size', '1024x1024')
+    
+    # 内容审核
+    if moderate_check(prompt):
+        return jsonify({
+            "error": {
+                "message": "Content policy violation",
+                "type": "policy_violation"
+            }
+        }), 400
+    
+    # 查找支持该模型的服务商
+    provider = find_provider_for_model(model)
+    if not provider:
+        return jsonify({
+            "error": {
+                "message": f"Model '{model}' not found",
+                "type": "invalid_request_error"
+            }
+        }), 400
+    
     try:
-        # 验证API密钥
-        if not verify_api_key(request.headers.get("Authorization", "")):
-            return jsonify({"error": "Unauthorized: Invalid API key"}), 401
+        # 生成图像提示
+        enhanced_prompt = generate_image_prompt(provider.api_keys[0] if provider.api_keys else "", prompt)
         
+        # 调用API生成图像
+        options = {"size": size, "n": 1, "num_images": 1}
+        image_urls = call_provider_api(provider, model, enhanced_prompt, options)
+        
+        # 构建OpenAI格式响应
+        data_list = [{"url": url} for url in image_urls]
+        
+        response = {
+            "created": int(time.time()),
+            "data": data_list
+        }
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        logger.error(f"图像生成失败: {str(e)}")
+        return jsonify({
+            "error": {
+                "message": f"Image generation failed: {str(e)}",
+                "type": "server_error"
+            }
+        }), 500
+
+@app.route("/gen", methods=["GET", "POST"])
+@verify_permission("user")  # 默认用户级别
+def simple_gen():
+    """简单的图像生成接口，支持GET和POST，只支持1:1且一次一张"""
+    if request.method == "GET":
+        prompt = request.args.get('prompt', '').strip()
+        model = request.args.get('model', '')
+    else:
+        data = request.get_json() or {}
+        prompt = data.get('prompt', '').strip()
+        model = data.get('model', '')
+    
+    if not prompt:
+        return jsonify({"error": "prompt parameter is required"}), 400
+    
+    # 内容审核
+    if moderate_check(prompt):
+        return jsonify({"error": "Content policy violation"}), 400
+    
+    # 如果没有指定模型，使用第一个可用模型
+    if not model:
+        all_models = get_all_supported_models()
+        if not all_models:
+            return jsonify({"error": "No models available"}), 500
+        model = all_models[0]
+    
+    # 查找支持该模型的服务商
+    provider = find_provider_for_model(model)
+    if not provider:
+        return jsonify({"error": f"Model '{model}' not found"}), 400
+    
+    try:
+        # 提取种子值
+        prompt, seed = extract_seed_from_text(prompt)
+        
+        # 生成图像提示
+        enhanced_prompt = generate_image_prompt(provider.api_keys[0] if provider.api_keys else "", prompt)
+        
+        # 固定使用1:1比例
+        options = {"size": "1024x1024", "n": 1, "num_images": 1}
+        if seed is not None:
+            options["seed"] = seed
+        
+        # 调用API生成图像
+        image_urls = call_provider_api(provider, model, enhanced_prompt, options)
+        
+        # 处理响应
+        success, image_url, final_url = process_image_response(image_urls, enhanced_prompt)
+        
+        if success:
+            return jsonify({
+                "success": True,
+                "prompt": enhanced_prompt,
+                "model": model,
+                "size": "1024x1024",
+                "image_url": final_url,
+                "seed": seed
+            })
+        else:
+            return jsonify({"error": f"Image generation failed: {image_url}"}), 500
+            
+    except Exception as e:
+        logger.error(f"图像生成失败: {str(e)}")
+        return jsonify({"error": f"Image generation failed: {str(e)}"}), 500
+
+@app.route("/v1/chat/completions", methods=["POST"])
+@verify_permission("user")  # 默认用户级别
+def handle_request():
+    """处理图像生成请求（保持原有功能，但限制为一次一张）"""
+    try:
         body = request.json
         
-        # 验证请求
         if not body or "model" not in body or "messages" not in body or not body["messages"]:
             return jsonify({"error": "Bad Request: Missing required fields"}), 400
         
-        # 检查模型是否下架
         if "janus" in body["model"].lower():
             return jsonify({"error": f"该模型已下架: {body['model']}"}), 410
         
@@ -591,70 +993,46 @@ def handle_request():
                 full_context += message["content"] + "\n\n"
         context = full_context.strip()
         
-        # 提取图片数量
-        context, image_count = extract_image_count(context)
+        # 强制限制为1张图片
+        context, seed = extract_seed_from_text(context)
+        final_count = 1  # 强制限制
         
         # 内容审核
         if moderate_check(context):
             nsfw_response = "Warning: Prohibited Content Detected! 🚫\n\nYour request contains banned keywords. Please check the content and try again.\n\n-----------------------\n\n警告：请求包含被禁止的关键词，请检查后重试！⚠️"
             
-            # 流式响应
             if body.get("stream", False):
                 def generate():
                     unique_id = int(time.time() * 1000)
                     current_timestamp = int(time.time())
                     
-                    # 初始响应
                     initial_payload = {
                         "id": unique_id,
                         "object": "chat.completion.chunk",
                         "created": current_timestamp,
                         "model": body["model"],
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"role": "assistant"},
-                                "finish_reason": None,
-                                "logprobs": None
-                            }
-                        ],
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None, "logprobs": None}],
                         "system_fingerprint": "fp_default"
                     }
                     yield f"data: {json.dumps(initial_payload)}\n\n"
                     
-                    # 分块发送NSFW警告
                     for chunk in nsfw_response:
                         payload = {
                             "id": unique_id,
                             "object": "chat.completion.chunk",
                             "created": current_timestamp,
                             "model": body["model"],
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": chunk},
-                                    "finish_reason": None,
-                                    "logprobs": None
-                                }
-                            ],
+                            "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None, "logprobs": None}],
                             "system_fingerprint": "fp_default"
                         }
                         yield f"data: {json.dumps(payload)}\n\n"
                     
-                    # 结束响应
                     end_payload = {
                         "id": unique_id,
                         "object": "chat.completion.chunk",
                         "created": current_timestamp,
                         "model": body["model"],
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": "stop",
-                                "logprobs": None
-                            }
-                        ],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop", "logprobs": None}],
                         "system_fingerprint": "fp_default"
                     }
                     yield f"data: {json.dumps(end_payload)}\n\n"
@@ -662,119 +1040,28 @@ def handle_request():
                 
                 return Response(stream_with_context(generate()), content_type="text/event-stream")
             
-            # 非流式响应
             else:
                 response_payload = {
                     "id": int(time.time() * 1000),
                     "object": "chat.completion",
                     "created": int(time.time()),
                     "model": body["model"],
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": nsfw_response
-                            },
-                            "logprobs": None,
-                            "finish_reason": "stop"
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": len(context),
-                        "completion_tokens": len(nsfw_response),
-                        "total_tokens": len(context) + len(nsfw_response)
-                    }
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": nsfw_response}, "logprobs": None, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": len(context), "completion_tokens": len(nsfw_response), "total_tokens": len(context) + len(nsfw_response)}
                 }
                 return jsonify(response_payload)
         
-        # 获取外部API密钥列表
-        try:
-            api_keys = get_env("API_KEYS", "").split(",")
-            if not api_keys or api_keys[0] == "":
-                raise ValueError("API_KEYS environment variable not set")
-            
-            # 确保有可用的API密钥
-            available_keys = len(api_keys)
-            max_images = get_env_int("MAX_IMAGES_PER_REQUEST", 4)
-            
-            # 用户请求的图片数量不能超过环境变量限制
-            requested_count = min(image_count, max_images)
-            
-            # 最终生成的图片数量为用户请求的数量（受环境变量限制）
-            final_count = requested_count
-            
-            logger.info(f"环境变量限制: {max_images}张, 用户请求: {image_count}张, 可用API密钥: {available_keys}个, 最终生成: {final_count}张")
-            
-            # 选择API密钥，允许重复使用以实现负载均衡
-            selected_keys = []
-            for i in range(final_count):
-                # 循环使用可用的API密钥
-                key_index = i % available_keys
-                selected_keys.append(api_keys[key_index])
-            
-            logger.info(f"已选择 {len(selected_keys)} 个API密钥用于图像生成（可能包含重复使用的密钥）")
-        except ValueError as e:
-            logger.error(f"获取外部API密钥失败: {e}")
-            return jsonify({"error": "未配置外部API密钥，请设置API_KEYS环境变量"}), 500
+        # 查找支持该模型的服务商
+        provider = find_provider_for_model(body["model"])
+        if not provider:
+            return jsonify({"error": f"未找到支持该模型的服务商: {body['model']}"}), 404
         
         # 生成图像提示
-        prompt = generate_image_prompt(selected_keys[0], context)
-        # 确保prompt不包含换行符，避免Markdown格式问题
+        prompt = generate_image_prompt(provider.api_keys[0] if provider.api_keys else "", context)
         safe_prompt = prompt.replace("\n", " ")
         
-        image_size = match_resolution(context)  # 从原始上下文中匹配分辨率，而不是从生成的提示中
+        image_size = match_resolution(context)
         logger.info(f"用户请求的图像尺寸: {image_size}")
-        
-        # 配置API URL
-        api_base_url = get_env("API_BASE_URL", "https://api.siliconflow.cn")
-        
-        # 准备多个请求配置
-        request_configs = []
-        for i in range(final_count):
-            # 根据模型选择合适的API端点
-            if body["model"] == "Kwai-Kolors/Kolors":
-                new_url = f"{api_base_url}/v1/images/generations"
-                new_request_body = {
-                    "model": body["model"],
-                    "prompt": prompt,
-                    "image_size": image_size,
-                    "batch_size": 1,
-                    "num_inference_steps": 20,
-                    "guidance_scale": 7.5
-                }
-            elif "flux" in body["model"].lower():
-                new_url = f"{api_base_url}/v1/image/generations"
-                new_request_body = {
-                    "model": body["model"],
-                    "prompt": prompt,
-                    "image_size": image_size,
-                    "num_inference_steps": 20,
-                    "prompt_enhancement": True
-                }
-            else:
-                new_url = f"{api_base_url}/v1/{body['model']}/text-to-image"
-                new_request_body = {
-                    "prompt": prompt,
-                    "image_size": image_size,
-                    "num_inference_steps": 20
-                }
-            
-            # 设置外部API请求头 - 使用API_KEYS中的密钥，而不是服务的API_KEY
-            headers = {
-                "accept": "application/json",
-                "content-type": "application/json",
-                "Authorization": f"Bearer {selected_keys[i]}"
-            }
-            
-            request_configs.append({
-                "url": new_url,
-                "body": new_request_body,
-                "headers": headers,
-                "index": i
-            })
-        
-        logger.info(f"准备发送 {len(request_configs)} 个并发请求")
         
         unique_id = int(time.time() * 1000)
         current_timestamp = int(time.time())
@@ -782,394 +1069,139 @@ def handle_request():
         # 流式响应
         if body.get("stream", False):
             def generate():
-                # 初始响应 - 角色信息
                 initial_payload = {
                     "id": unique_id,
                     "object": "chat.completion.chunk",
                     "created": current_timestamp,
                     "model": body["model"],
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant"},
-                            "finish_reason": None,
-                            "logprobs": None
-                        }
-                    ],
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None, "logprobs": None}],
                     "system_fingerprint": "fp_default"
                 }
                 yield f"data: {json.dumps(initial_payload)}\n\n"
                 
-                # 确保立即刷新
                 time.sleep(0.1)
                 
-                # 提示信息
                 prompt_payload = {
                     "id": unique_id,
                     "object": "chat.completion.chunk",
                     "created": current_timestamp,
                     "model": body["model"],
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "content": f"```\n{{\n  \"prompt\":\"{safe_prompt}\",\n  \"count\":{final_count}\n}}\n```\n"
-                            }
-                        }
-                    ],
+                    "choices": [{"index": 0, "delta": {"content": f"\`\`\`\n{{\n  \"prompt\":\"{safe_prompt}\",\n  \"count\":{final_count}\n}}\n\`\`\`\n"}}],
                     "finish_reason": None
                 }
                 yield f"data: {json.dumps(prompt_payload)}\n\n"
                 
-                # 等待一小段时间，确保客户端收到提示信息
                 time.sleep(0.5)
                 
-                # 任务进行中
                 task_payload = {
                     "id": unique_id,
                     "object": "chat.completion.chunk",
                     "created": current_timestamp,
                     "model": body["model"],
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "content": f"> 正在生成 {final_count} 张图片..."
-                            }
-                        }
-                    ],
+                    "choices": [{"index": 0, "delta": {"content": f"> 正在生成 {final_count} 张图片..."}}],
                     "finish_reason": None
                 }
                 yield f"data: {json.dumps(task_payload)}\n\n"
                 
-                # 等待一小段时间，确保客户端收到进行中信息
                 time.sleep(0.5)
                 
-                # 使用线程池并发请求
-                import concurrent.futures
-                
-                def make_request(config):
-                    try:
-                        logger.info(f"发送请求 #{config['index']+1} 到: {config['url']}")
-                        logger.info(f"使用API密钥: {config['headers']['Authorization'][:15]}...")
-                        response = requests.post(
-                            config['url'], 
-                            json=config['body'], 
-                            headers=config['headers'],
-                            timeout=60  # 增加超时时间
-                        )
-                        return {
-                            "index": config['index'],
-                            "status_code": response.status_code,
-                            "response": response.json() if response.status_code == 200 else {"error": response.text}
-                        }
-                    except Exception as e:
-                        logger.error(f"请求 #{config['index']+1} 失败: {str(e)}")
-                        return {
-                            "index": config['index'],
-                            "status_code": 500,
-                            "response": {"error": str(e)}
-                        }
-                
-                # 创建线程池
-                with concurrent.futures.ThreadPoolExecutor(max_workers=final_count) as executor:
-                    # 提交所有请求
-                    future_to_config = {executor.submit(make_request, config): config for config in request_configs}
+                try:
+                    options = {
+                        "size": image_size,
+                        "n": 1,
+                        "num_images": 1
+                    }
                     
-                    # 处理完成的请求
-                    for i, future in enumerate(concurrent.futures.as_completed(future_to_config)):
-                        config = future_to_config[future]
-                        try:
-                            result = future.result()
-                            logger.info(f"请求 #{result['index']+1} 完成，状态码: {result['status_code']}")
-                            
-                            # 处理响应
-                            if result['status_code'] == 200:
-                                response_body = result['response']
-                                
-                                # 检查响应中是否包含图像URL
-                                if isinstance(response_body, dict) and "images" in response_body and response_body["images"]:
-                                    # 确保images是列表且包含字典元素
-                                    if isinstance(response_body["images"], list) and len(response_body["images"]) > 0:
-                                        image_item = response_body["images"][0]
-                                        if isinstance(image_item, dict) and "url" in image_item:
-                                            image_url = image_item["url"]
-                                            logger.info(f"请求 #{result['index']+1} 接收到的 imageURL: {image_url}")
-                                            
-                                            # 生成短链接
-                                            short_url = generate_short_url(image_url)
-                                            
-                                            # 上传到蓝空图床
-                                            lsky_url = upload_to_lsky_pro(image_url)
-                                            
-                                            # 构建响应文本
-                                            if lsky_url:
-                                                image_text = f"\n\n图片 #{result['index']+1}/{final_count} 生成完成 ✅\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n蓝空图床链接(永久有效)：{lsky_url}\n\n![image{result['index']+1}|{safe_prompt}]({lsky_url})"
-                                            else:
-                                                image_text = f"\n\n图片 #{result['index']+1}/{final_count} 生成完成 ✅\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n![image{result['index']+1}|{safe_prompt}]({short_url})"
-                                            
-                                            # 发送图片结果
-                                            image_payload = {
-                                                "id": unique_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": current_timestamp,
-                                                "model": body["model"],
-                                                "choices": [
-                                                    {
-                                                        "index": 0,
-                                                        "delta": {
-                                                            "content": image_text
-                                                        }
-                                                    }
-                                                ],
-                                                "finish_reason": None
-                                            }
-                                            yield f"data: {json.dumps(image_payload)}\n\n"
-                                        else:
-                                            logger.error(f"请求 #{result['index']+1} 图像项格式错误: {image_item}")
-                                            error_text = f"\n\n图片 #{result['index']+1}/{final_count} 生成失败 ❌ - 图像格式错误"
-                                            error_payload = {
-                                                "id": unique_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": current_timestamp,
-                                                "model": body["model"],
-                                                "choices": [
-                                                    {
-                                                        "index": 0,
-                                                        "delta": {
-                                                            "content": error_text
-                                                        }
-                                                    }
-                                                ],
-                                                "finish_reason": None
-                                            }
-                                            yield f"data: {json.dumps(error_payload)}\n\n"
-                                    else:
-                                        logger.error(f"请求 #{result['index']+1} 图像列表格式错误: {response_body['images']}")
-                                        error_text = f"\n\n图片 #{result['index']+1}/{final_count} 生成失败 ❌ - 图像列表格式错误"
-                                        error_payload = {
-                                            "id": unique_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": current_timestamp,
-                                            "model": body["model"],
-                                            "choices": [
-                                                {
-                                                    "index": 0,
-                                                    "delta": {
-                                                        "content": error_text
-                                                    }
-                                                }
-                                            ],
-                                            "finish_reason": None
-                                        }
-                                        yield f"data: {json.dumps(error_payload)}\n\n"
-                                else:
-                                    error_msg = "未知错误"
-                                    if isinstance(response_body, dict) and "message" in response_body:
-                                        error_msg = str(response_body["message"])
-                                    logger.error(f"请求 #{result['index']+1} 画图失败：{response_body}")
-                                    error_text = f"\n\n图片 #{result['index']+1}/{final_count} 生成失败 ❌ - {error_msg}"
-                                    error_payload = {
-                                        "id": unique_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": current_timestamp,
-                                        "model": body["model"],
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {
-                                                    "content": error_text
-                                                }
-                                            }
-                                        ],
-                                        "finish_reason": None
-                                    }
-                                    yield f"data: {json.dumps(error_payload)}\n\n"
-                            else:
-                                logger.error(f"请求 #{result['index']+1} 返回错误状态码: {result['status_code']}")
-                                error_text = f"\n\n图片 #{result['index']+1}/{final_count} 生成失败 ❌ - 服务器返回错误: {result['status_code']}"
-                                error_payload = {
-                                    "id": unique_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": current_timestamp,
-                                    "model": body["model"],
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {
-                                                "content": error_text
-                                            }
-                                        }
-                                    ],
-                                    "finish_reason": None
-                                }
-                                yield f"data: {json.dumps(error_payload)}\n\n"
-                        except Exception as e:
-                            logger.error(f"处理请求 #{config['index']+1} 结果时出错: {str(e)}")
-                            error_text = f"\n\n图片 #{config['index']+1}/{final_count} 生成失败 ❌ - 处理结果时出错: {str(e)}"
-                            error_payload = {
-                                "id": unique_id,
-                                "object": "chat.completion.chunk",
-                                "created": current_timestamp,
-                                "model": body["model"],
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {
-                                            "content": error_text
-                                        }
-                                    }
-                                ],
-                                "finish_reason": None
-                            }
-                            yield f"data: {json.dumps(error_payload)}\n\n"
+                    if seed is not None:
+                        options["seed"] = seed
+                    
+                    logger.info(f"开始生成图片")
+                    image_urls = call_provider_api(provider, body["model"], prompt, options)
+                    
+                    success, image_text, _ = process_image_response(image_urls, prompt)
+                    
+                    if success:
+                        image_content = f"\n\n图片生成完成 ✅\n\n![image|{safe_prompt}]({image_text})"
+                    else:
+                        image_content = f"\n\n图片生成失败 ❌ - {image_text}"
+                    
+                    image_payload = {
+                        "id": unique_id,
+                        "object": "chat.completion.chunk",
+                        "created": current_timestamp,
+                        "model": body["model"],
+                        "choices": [{"index": 0, "delta": {"content": image_content}}],
+                        "finish_reason": None
+                    }
+                    yield f"data: {json.dumps(image_payload)}\n\n"
+                    
+                except Exception as e:
+                    logger.error(f"生成图片失败: {str(e)}")
+                    error_text = f"\n\n图片生成失败 ❌ - {str(e)}"
+                    error_payload = {
+                        "id": unique_id,
+                        "object": "chat.completion.chunk",
+                        "created": current_timestamp,
+                        "model": body["model"],
+                        "choices": [{"index": 0, "delta": {"content": error_text}}],
+                        "finish_reason": None
+                    }
+                    yield f"data: {json.dumps(error_payload)}\n\n"
                 
-                # 所有图片处理完成
                 completion_payload = {
                     "id": unique_id,
                     "object": "chat.completion.chunk",
                     "created": current_timestamp,
                     "model": body["model"],
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "content": f"\n\n所有 {final_count} 张图片处理完成。"
-                            }
-                        }
-                    ],
+                    "choices": [{"index": 0, "delta": {"content": f"\n\n图片处理完成。"}}],
                     "finish_reason": None
                 }
                 yield f"data: {json.dumps(completion_payload)}\n\n"
-                
-                # 结束响应
                 yield "data: [DONE]\n\n"
             
             return Response(
                 stream_with_context(generate()),
                 content_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "X-Accel-Buffering": "no",  # 禁用Nginx缓冲
-                    "Connection": "keep-alive"
-                }
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
             )
         
-        # 非流式响应 - 只返回第一张图片的结果
+        # 非流式响应
         else:
             try:
-                config = request_configs[0]
-                logger.info(f"发送请求到: {config['url']}")
-                logger.info(f"请求头: {config['headers']}")
-                logger.info(f"请求体: {config['body']}")
+                options = {
+                    "size": image_size,
+                    "n": 1,
+                    "num_images": 1
+                }
                 
-                response = requests.post(config['url'], json=config['body'], headers=config['headers'])
+                if seed is not None:
+                    options["seed"] = seed
                 
-                logger.info(f"API响应状态码: {response.status_code}")
-                logger.info(f"API响应内容: {response.text[:200]}...")
+                logger.info(f"开始生成图片")
+                image_urls = call_provider_api(provider, body["model"], prompt, options)
                 
-                # 确保响应是JSON格式
-                try:
-                    response_body = response.json()
-                except json.JSONDecodeError as e:
-                    logger.error(f"解析API响应失败: {e}, 响应内容: {response.text}")
-                    return jsonify({"error": f"解析API响应失败: {response.text[:100]}..."}), 500
+                success, image_text, image_url = process_image_response(image_urls, prompt)
                 
-                # 检查响应中是否包含图像URL
-                if isinstance(response_body, dict) and "images" in response_body and response_body["images"]:
-                    # 确保images是列表且包含字典元素
-                    if isinstance(response_body["images"], list) and len(response_body["images"]) > 0:
-                        image_item = response_body["images"][0]
-                        if isinstance(image_item, dict) and "url" in image_item:
-                            image_url = image_item["url"]
-                            logger.info(f"接收到的 imageURL: {image_url}")
-                            
-                            # 生成短链接
-                            short_url = generate_short_url(image_url)
-                            
-                            # 上传到蓝空图床
-                            lsky_url = upload_to_lsky_pro(image_url)
-                            
-                            # 构建响应文本
-                            escaped_prompt = json.dumps(safe_prompt)[1:-1]  # 使用json.dumps处理转义
-                            
-                            if lsky_url:
-                                response_text = f"\n{{\n \"prompt\":\"{escaped_prompt}\",\n \"image_size\": \"{image_size}\",\n \"count\": {final_count}\n}}\n\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n蓝空图床链接(永久有效)：{lsky_url}\n\n![image1|{safe_prompt}]({lsky_url})"
-                            else:
-                                response_text = f"\n{{\n \"prompt\":\"{escaped_prompt}\",\n \"image_size\": \"{image_size}\",\n \"count\": {final_count}\n}}\n\n下载链接(链接有时效性，及时下载保存)：{short_url}\n\n![image1|{safe_prompt}]({short_url})"
-                            
-                            return jsonify(send_response(body, response_text))
-                        else:
-                            logger.error(f"图像项格式错误: {image_item}")
-                            return jsonify({"error": "图像格式错误"}), 500
-                    else:
-                        logger.error(f"图像列表格式错误: {response_body['images']}")
-                        return jsonify({"error": "图像列表格式错误"}), 500
+                if success:
+                    escaped_prompt = json.dumps(safe_prompt)[1:-1]
+                    response_text = f"\n{{\n \"prompt\":\"{escaped_prompt}\",\n \"image_size\": \"{image_size}\",\n \"count\": {final_count}\n}}\n\n图片生成完成 ✅\n\n![image|{safe_prompt}]({image_text})"
+                    
+                    return jsonify({
+                        "id": int(time.time() * 1000),
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": body["model"],
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": response_text}, "logprobs": None, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": len(body["messages"][-1]["content"]), "completion_tokens": len(response_text), "total_tokens": len(body["messages"][-1]["content"]) + len(response_text)}
+                    })
                 else:
-                    error_msg = "未知错误"
-                    if isinstance(response_body, dict) and "message" in response_body:
-                        error_msg = str(response_body["message"])
-                    logger.error(f"画图失败：{response_body}")
-                    response_text = f"生成图像失败: {error_msg}"
-                    return jsonify(send_response(body, response_text))
-            
-            except Exception as e:
-                logger.error(f"Error: {str(e)}")
-                return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
-    
-    except Exception as e:
-        logger.error(f"Request handling error: {str(e)}")
-        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
-
-@app.route("/health", methods=["GET"])
-def health_check():
-    """健康检查端点"""
-    return "OK", 200
-
-if __name__ == "__main__":
-    # 获取端口
-    port = int(get_env("PORT", "7860"))
-    
-    # 获取图像提示模型
-    image_prompt_model = get_env("IMAGE_PROMPT_MODEL", "Qwen/Qwen2.5-7B-Instruct")
-    
-    # 获取最大图片数量
-    max_images = get_env_int("MAX_IMAGES_PER_REQUEST", 4)
-    
-    # 获取API密钥
-    service_api_key = get_env("API_KEY", "")
-    if service_api_key:
-        logger.info("服务API密钥鉴权已启用")
-    else:
-        logger.warning("服务API密钥鉴权未启用，服务可能被任何人访问")
-    
-    # 检查外部API密钥
-    external_api_keys = get_env("API_KEYS", "").split(",")
-    if not external_api_keys or external_api_keys[0] == "":
-        logger.error("未配置外部API密钥，请设置API_KEYS环境变量")
-    else:
-        logger.info(f"已配置 {len(external_api_keys)} 个外部API密钥")
-    
-    # 检查短链接服务配置
-    if get_env_bool("USE_SHORTLINK", False):
-        logger.info("短链接服务已启用")
-        if not get_env("SHORTLINK_BASE_URL") or not get_env("SHORTLINK_API_KEY"):
-            logger.warning("短链接服务配置不完整，请检查SHORTLINK_BASE_URL和SHORTLINK_API_KEY环境变量")
-    else:
-        logger.info("短链接服务未启用")
-    
-    # 检查蓝空图床配置
-    if get_env_bool("USE_LSKY_PRO", False):
-        logger.info("蓝空图床已启用")
-        if not get_env("LSKY_PRO_URL") or not get_env("LSKY_PRO_TOKEN"):
-            logger.warning("蓝空图床配置不完整，请检查LSKY_PRO_URL和LSKY_PRO_TOKEN环境变量")
-    else:
-        logger.info("蓝空图床未启用")
-    
-    logger.info(f"服务配置: 端口={port}, 模型={image_prompt_model}, 最大图片数量={max_images}")
-    logger.info(f"关键词过滤: {get_env('BANNED_KEYWORDS', '')}")
-    logger.info(f"支持的模型数量: {len(SUPPORTED_MODELS)}")
-    
-    # 启动服务
-    app.run(host="0.0.0.0", port=port)
+                    logger.error(f"画图失败：{image_text}")
+                    response_text = f"生成图像失败: {image_text}"
+                    return jsonify({
+                        "id": int(time.time() * 1000),
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": body["model"],
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": response_text}, "logprobs": None, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": len(body["messages"][-1]["content"]),
 
